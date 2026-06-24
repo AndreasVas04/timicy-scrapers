@@ -1,0 +1,149 @@
+# How the TimiCY Scrapers Work
+
+TimiCY collects product data from different Cyprus stores and saves everything in the same format.
+
+The hard part is that every store exposes its products differently. So there is not one single scraper that works for all of them. Each store needs its own approach.
+
+In the end, though, every scraper produces the same kind of output: one product row with fields like title, price, brand, SKU, MPN, availability, image URL and product URL.
+
+---
+
+## The basic idea
+
+A scraper usually does three things:
+
+```text
+find product pages
+fetch product data
+save clean results
+```
+
+For some stores, finding the products is easy because they provide an API.
+
+For others, we first read a sitemap. A sitemap is an XML file that lists pages from a website. Stores use it mainly so search engines can discover their pages.
+
+Example:
+
+```xml
+<url>
+  <loc>https://www.stephanis.com.cy/en/products/196585</loc>
+</url>
+```
+
+Once we have the product URLs or product IDs, we request the data and extract only the fields we need.
+
+---
+
+## What each scraper does
+
+| Store       | Approach                                                                                                |
+| ----------- | ------------------------------------------------------------------------------------------------------- |
+| iStorm      | Uses Shopify’s `/products.json` endpoint. This gives product data directly as JSON.                     |
+| Kotsovolos  | Reads the category tree, then calls the product API for each category.                                  |
+| Stephanis   | Reads the sitemap, opens each product page, and extracts JSON-LD from the HTML.                         |
+| Electroline | Reads the WordPress product sitemaps and extracts Yoast JSON-LD from each product page.                 |
+| Public      | Reads product IDs from the sitemap, then calls `/public/v2/sku/{id}` for each product.                  |
+| Bionic      | Reads the product sitemap, opens each product page, and extracts the embedded React JSON from the HTML. |
+
+None of the current scrapers use Playwright. At first it looked like some stores might need browser automation, but the final version uses lighter sources such as APIs, JSON-LD, sitemaps and embedded page JSON.
+
+---
+
+## Why the data is normalized
+
+Each store uses different field names.
+
+One store might call the product name `title`, another might call it `displayName`, and another might put it inside a JSON-LD block.
+
+So after fetching the raw data, each scraper converts it into the same structure.
+
+Example output fields:
+
+```text
+store
+store_product_id
+title
+vendor
+product_type
+sku
+price
+available
+image_url
+product_url
+mpn
+ean
+mpn_root
+identifier_source
+scraped_at
+```
+
+This makes the next steps easier, because the rest of the app does not need to care where the product came from.
+
+---
+
+## Product identifiers
+
+For price comparison, matching products by title is not reliable enough.
+
+For example, two stores may write the same product name differently.
+
+So the scrapers try to extract stronger identifiers where possible:
+
+```text
+SKU
+MPN
+EAN / barcode
+Apple part-number root
+```
+
+The `identifier_source` field shows where the identifier came from:
+
+```text
+sku
+api
+title_regex
+none
+```
+
+This helps the matching layer understand how much it should trust the identifier.
+
+---
+
+## Saving the results
+
+Each scraper writes its results to a local JSON file, for example:
+
+```text
+data/istorm.json
+data/kotsovolos.json
+data/stephanis.json
+data/electroline.json
+data/public.json
+data/bionic.json
+```
+
+If Supabase credentials are available, the same rows are also uploaded to the `raw_products` table.
+
+The upload uses upsert logic:
+
+```text
+same store + same product ID = update existing row
+new product ID = insert new row
+```
+
+This avoids duplicates when a scraper is run more than once.
+
+---
+
+## Short version
+
+Each store is scraped differently, but all scrapers end in the same place:
+
+```text
+raw store data
+→ cleaned product row
+→ JSON file
+→ Supabase
+```
+
+That shared output format is what makes the rest of TimiCY possible.

@@ -1,0 +1,16 @@
+data/
+.env
+__pycache__/
+*.pyc
+.claude/
+
+venv/
+*.pyc
+.claude/
+category_mapping.csv.bak
+check_counts.py
+check_schema.py
+inspect_bucket.py
+check_dupes.py
+.env.local
+*.env
