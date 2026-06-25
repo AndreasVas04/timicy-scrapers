@@ -14,3 +14,4 @@ inspect_bucket.py
 check_dupes.py
 .env.local
 *.env
+inspect_schema.py
