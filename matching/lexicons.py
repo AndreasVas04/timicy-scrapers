@@ -201,6 +201,12 @@ BRAND_ALIASES: dict[str, str] = {
     # Breville / Sage
     "BREVILLE": "Breville",
     "SAGE": "Sage",
+
+    # Sencor
+    "SENCOR": "Sencor",
+
+    # Pro-Mounts
+    "PROMOUNTS": "Pro-Mounts",
 }
 
 
@@ -253,11 +259,32 @@ COLOR_WORDS: set[str] = {
     "μπεζ",        # beige
 
     # --- Vendor finishes (Apple / Samsung / Google etc.) ---
+    # This list grows with periodic data inspection — add entries confirmed in
+    # real scraper output. Perfection is not required here: the fuzzy title
+    # matching tier is the intended backstop for any color that still leaks.
+    # Multi-word phrases are matched longest-first at runtime, so adding a
+    # full phrase (e.g. "deep blue") is safe even when its modifier word
+    # ("deep") should NOT be stripped on its own.
+
+    # -- Multi-word finish phrases (full phrases only; risky standalone
+    #    modifiers like deep/space/light/shadow are NOT added solo) --
     "space gray",
     "space grey",
+    "space black",
     "sierra blue",
+    "pacific blue",
     "alpine green",
     "deep purple",
+    "deep blue",
+    "deep navy",
+    "baltic blue",
+    "anchor blue",
+    "electric lavender",
+    "soft pink",
+    "bright guava",
+    "light moss",
+    "cosmic orange",
+    "silver shadow",
     "natural titanium",
     "blue titanium",
     "black titanium",
@@ -265,19 +292,11 @@ COLOR_WORDS: set[str] = {
     "desert titanium",
     "titanium",
     "τιτανιο",     # titanium (Greek)
-    "graphite",
-    "midnight",
-    "starlight",
     "product red",
     "phantom black",
     "phantom white",
     "phantom",
     "mystic bronze",
-    "cream",
-    "lavender",
-    "burgundy",
-    "lime",
-    "mint",
     "ice blue",
     "sky blue",
     "ocean blue",
@@ -287,14 +306,48 @@ COLOR_WORDS: set[str] = {
     "matte black",
     "jet black",
     "ceramic white",
+    "cloudy white",
+    "stormy black",
+    "sorta sage",
+
+    # -- Single-word finishes (confirmed safe — never part of a model name
+    #    in this catalog, verified via scraper data inspection) --
+    "graphite",
+    "midnight",
+    "starlight",
     "obsidian",
     "hazel",
     "porcelain",
     "charcoal",
     "chalk",
-    "sorta sage",
-    "cloudy white",
-    "stormy black",
+    "cream",
+    "lavender",
+    "burgundy",
+    "lime",
+    "mint",
+    "clear",
+    "lilac",
+    "desert stone",
+    "inox",
+    "alpine",
+    "ocean",
+    "ultramarine",
+    "teal",
+    "navy",
+    "icyblue",
+    "peach",
+    "indigo",
+    "blush",
+    "citrus",
+    "vanilla",
+    "guava",
+    "tangerine",
+    "cosmic",
+    "lila",
+
+    # Samsung marketing prefix — appears as "Awesome Black/White/Lime/etc."
+    # Safe to strip standalone in this catalog.
+    "awesome",
 }
 
 

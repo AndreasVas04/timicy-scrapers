@@ -17,7 +17,13 @@ import json
 import sys
 from pathlib import Path
 
-from .normalize import normalize_brand, normalize_title
+from .normalize import (
+    extract_brand_from_title,
+    extract_model_codes,
+    looks_suspicious_brand,
+    normalize_brand,
+    normalize_title,
+)
 
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -76,9 +82,22 @@ def main():
         brand = normalize_brand(raw_vendor)
         title = normalize_title(raw_title, brand)
 
+        # Extract model codes from the raw title for cross-language matching.
+        model_codes = extract_model_codes(raw_title)
+
+        # Check whether the vendor-derived brand looks suspicious.
+        suspicious = looks_suspicious_brand(brand, raw_title)
+        suggested = None
+        if suspicious:
+            suggested = extract_brand_from_title(raw_title)
+
         print(f"  vendor:  {raw_vendor!r:40s}  ->  {brand}")
         print(f"  title:   {raw_title}")
         print(f"  normal:  {title}")
+        print(f"  models:  {model_codes}")
+        if suspicious:
+            flag = f"  brand?:  SUSPICIOUS (suggested: {suggested})"
+            print(flag)
         print("-" * 100)
 
 

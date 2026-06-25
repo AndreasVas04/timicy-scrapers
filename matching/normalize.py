@@ -44,6 +44,14 @@ _RE_STORAGE = re.compile(
     re.IGNORECASE,
 )
 
+# Regex for volume quantities: a number with dot or comma decimal, optional
+# space, then "l" or "ml" at a word boundary. Handles cases like "1,25L",
+# "0.5 L", "500ml". Normalizes the decimal separator to a dot.
+_RE_VOLUME = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*(ml|l)\b",
+    re.IGNORECASE,
+)
+
 # Regex for screen sizes: a number (dot or comma decimal), optional space,
 # then an inch indicator (", '', ″, inch, inches, in, ίντσες, ιντσών).
 _RE_SCREEN = re.compile(
@@ -123,15 +131,29 @@ def _replace_screen(m: re.Match) -> str:
     return f"{num}in"
 
 
+def _replace_volume(m: re.Match) -> str:
+    """Convert a volume match to normalized form with dot decimal.
+
+    Does NOT convert ml to l — keeps the original unit, just normalizes
+    the decimal separator and removes any space before the unit.
+    """
+    num = m.group(1).replace(",", ".")
+    unit = m.group(2).lower()
+    return f"{num}{unit}"
+
+
 def normalize_units(text: str) -> str:
-    """Normalize storage (GB/TB) and screen-size quantities in *text*.
+    """Normalize storage (GB/TB), screen-size, and volume quantities in *text*.
 
     - Storage: integer + optional space + gb/tb -> "{n}gb" (TB*1024).
     - Screen: number (dot or comma decimal) + inch indicator -> "{n}in".
+    - Volume: number (dot or comma decimal) + optional space + l/ml -> "{n}l"
+      or "{n}ml" with dot decimal. E.g. "1,25L" -> "1.25l", "0,5 L" -> "0.5l".
     - All other numbers are left untouched.
     """
     text = _RE_STORAGE.sub(_replace_storage, text)
     text = _RE_SCREEN.sub(_replace_screen, text)
+    text = _RE_VOLUME.sub(_replace_volume, text)
     return text
 
 
@@ -179,6 +201,10 @@ def normalize_title(raw_title: str | None, brand_norm: str = "") -> str:
 
     # Remove the canonical brand and any known alias forms so that
     # "SAMSUNG Galaxy S24" and "Galaxy S24" produce the same output.
+    # Also handles hyphenated brand forms: e.g. vendor "PRO-MOUNTS" has
+    # lookup key "PROMOUNTS", but the title text "PRO-MOUNTS" would survive
+    # without this extra step. We generate spacing/hyphen variants of each
+    # alias key and strip those too, before punctuation removal.
     if brand_norm:
         # Remove canonical brand (lowercased).
         brand_lower = brand_norm.lower()
@@ -186,7 +212,8 @@ def normalize_title(raw_title: str | None, brand_norm: str = "") -> str:
             r"(?<!\w)" + re.escape(strip_accents(brand_lower)) + r"(?!\w)"
         )
         text = brand_pattern.sub("", text)
-        # Also remove any raw alias that maps to this brand.
+        # Also remove any raw alias that maps to this brand, plus its
+        # common hyphen/space variants derived from the title text.
         for alias_key, canonical in BRAND_ALIASES.items():
             if canonical == brand_norm:
                 alias_lower = alias_key.lower()
@@ -194,6 +221,25 @@ def normalize_title(raw_title: str | None, brand_norm: str = "") -> str:
                     r"(?<!\w)" + re.escape(alias_lower) + r"(?!\w)"
                 )
                 text = alias_pat.sub("", text)
+        # Strip any remaining token that, after removing hyphens/spaces,
+        # matches the lookup-normalized brand key. This catches hyphenated
+        # forms like "pro-mounts" whose stripped form is "promounts".
+        brand_key = _make_lookup_key(brand_norm)
+        if brand_key:
+            # Match tokens that may contain hyphens/spaces but whose
+            # alphanumeric content equals the brand key.
+            def _brand_variant_replacer(m: re.Match) -> str:
+                candidate = re.sub(r"[^A-Za-z0-9]", "", m.group(0)).upper()
+                if candidate == brand_key:
+                    return ""
+                return m.group(0)
+            # Pattern: sequences of word-chars optionally joined by
+            # single hyphens or spaces (to catch "pro-mounts", "pro mounts").
+            text = re.sub(
+                r"(?<!\w)\w+(?:[-\s]\w+)*(?!\w)",
+                _brand_variant_replacer,
+                text,
+            )
 
     text = strip_color(text)
 
@@ -300,3 +346,186 @@ def title_key(brand_norm: str, category: str, title_norm: str) -> str:
     if not b or not c or not h:
         return ""
     return f"title:{b}:{c}:{h}"
+
+
+# ---------------------------------------------------------------------------
+# 10. Model-code extraction (pure)
+# ---------------------------------------------------------------------------
+
+# Known unit suffixes to exclude from model-code candidates.
+# A token like "1024gb" or "800w" is a spec value, not a model code.
+# The second group ("bar", "lt", etc.) are non-discriminative spec/quantity
+# suffixes found in real data — "15bar", "13lt", "5tmx" are sizes/quantities,
+# not manufacturer model codes, and would cause false matches.
+_UNIT_SUFFIXES = {
+    "gb", "tb", "mb", "kb",
+    "mah", "wh", "w", "v", "a",
+    "mbps", "gbps", "ghz", "mhz", "hz",
+    "in", "mm", "cm", "nm",
+    "l", "ml",
+    "rpm",
+    "k",
+    # Spec/quantity suffixes added from data inspection:
+    "bar",   # pressure rating (e.g. "15bar")
+    "lt",    # liters, alternate abbreviation (e.g. "13lt", "10lt")
+    "pin",   # pin count (e.g. "2pin")
+    "bit",   # bit depth (e.g. "24bit")
+    "pcs",   # piece count (e.g. "100pcs")
+    "tmx",   # Greek τεμάχια / pieces (e.g. "5tmx")
+}
+
+# Regex to split a token's trailing alphabetic suffix from its numeric prefix,
+# used for the unit-suffix exclusion check.
+_RE_UNIT_TOKEN = re.compile(r"^(\d+(?:\.\d+)?)([a-z]+)$")
+
+
+def _contains_greek(token: str) -> bool:
+    """Return True if *token* contains any Greek character (U+0370–U+03FF).
+
+    Model codes must be pure Latin alphanumeric to match reliably across
+    stores. A code mixing Greek and Latin scripts (e.g. "c1001lβ" where
+    the trailing character is Greek beta) will never match the same code
+    written in Latin at another store, so it is not a usable signal.
+    """
+    return any("\u0370" <= ch <= "\u03ff" for ch in token)
+
+
+def extract_model_codes(text: str) -> list[str]:
+    """Pull tokens that look like manufacturer model codes from *text*.
+
+    Model codes (e.g. "scg6050ss", "mg23k3515as", "np-by1") are strong
+    cross-language match signals because stores often describe the same
+    product in different languages, making model codes the only shared text.
+
+    Processing:
+      1. Lowercase and strip accents.
+      2. Join alphanumeric segments separated by a single hyphen or slash
+         into one token (so "np-by1" becomes "npby1").
+      3. Split on whitespace.
+      4. A token qualifies if ALL of the following hold:
+         - alphanumeric-only (after the join step),
+         - length >= 4,
+         - contains at least one Latin letter AND one digit,
+         - contains NO Greek characters (mixed-script tokens are not
+           usable as cross-store match signals),
+         - is NOT a known unit/spec token (e.g. "1024gb", "800w", "15bar").
+
+    Returns a de-duplicated list in first-seen order.
+
+    Known limitation: codes that appear space-separated in the source
+    (e.g. "SWK 2511BK" -> "swk 2511bk") are NOT joined and will be missed
+    by this single-token rule. Rejoining is deliberately left to the matcher
+    stage where brand/category context is available to do it safely.
+    """
+    if not text:
+        return []
+
+    # Lowercase and strip accents to normalize the input.
+    t = strip_accents(text.lower())
+
+    # Join alphanumeric segments separated by a single hyphen or slash.
+    # "np-by1" -> "npby1", "abc/def" -> "abcdef", but "a--b" stays as-is.
+    t = re.sub(r"([a-z0-9])[-/]([a-z0-9])", r"\1\2", t)
+
+    tokens = t.split()
+    seen: set[str] = set()
+    result: list[str] = []
+
+    for tok in tokens:
+        # Must be purely alphanumeric after the join step.
+        if not tok.isalnum():
+            continue
+        # Must be at least 4 characters.
+        if len(tok) < 4:
+            continue
+        # Reject tokens containing Greek characters — mixed-script tokens
+        # will never match the same code in Latin at another store.
+        if _contains_greek(tok):
+            continue
+        # Must contain at least one letter and one digit.
+        has_alpha = any(c.isalpha() for c in tok)
+        has_digit = any(c.isdigit() for c in tok)
+        if not (has_alpha and has_digit):
+            continue
+        # Exclude tokens whose alphabetic suffix is a known unit or spec
+        # quantity (gb, w, mah, bar, lt, tmx, etc.).
+        m = _RE_UNIT_TOKEN.match(tok)
+        if m and m.group(2) in _UNIT_SUFFIXES:
+            continue
+        # De-duplicate, preserving first-seen order.
+        if tok not in seen:
+            seen.add(tok)
+            result.append(tok)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 11. Brand-trust primitives (pure, read-only inspection helpers)
+# ---------------------------------------------------------------------------
+# These functions only inspect data — they make no decisions and write nothing.
+# They are intended for a future matcher to consume.
+
+def known_canonical_brands() -> set[str]:
+    """Return the set of canonical brand strings from BRAND_ALIASES, lowercased.
+
+    Useful for quickly checking whether a brand value is recognized.
+    """
+    return {v.lower() for v in BRAND_ALIASES.values()}
+
+
+def extract_brand_from_title(raw_title: str | None) -> str | None:
+    """Try to find a known brand in the product title.
+
+    Lowercase + strip accents the title, tokenize on whitespace, and for
+    each token build the brand lookup key (uppercase, non-alphanumeric
+    removed). Return the canonical brand of the FIRST token that resolves
+    to a known brand, or None if no brand is found.
+
+    Example:
+        "Αποχυμωτής Αργής Σύνθλιψης Sencor ssj4050np" -> "Sencor"
+    """
+    if not raw_title:
+        return None
+
+    text = strip_accents(raw_title.lower())
+    tokens = text.split()
+
+    for tok in tokens:
+        key = _make_lookup_key(tok)
+        if key and key in BRAND_ALIASES:
+            return BRAND_ALIASES[key]
+
+    return None
+
+
+def looks_suspicious_brand(brand_norm: str, raw_title: str | None) -> bool:
+    """Return True if the brand value looks wrong and should be reviewed.
+
+    Flags the brand as suspicious if ANY of these hold:
+      - brand_norm is empty,
+      - brand_norm (lowercased) is NOT a known canonical brand AND the title
+        contains a known brand that differs from it.
+
+    Conservative by design — only flags when the title clearly offers a
+    better-known brand than the vendor field. This avoids false positives
+    on legitimate brands that simply aren't in BRAND_ALIASES yet.
+
+    Examples:
+        ("SSJ", "...Sencor ssj4050np")  -> True  (SSJ unknown, Sencor in title)
+        ("Apple", "iPhone 15 128GB")    -> False  (Apple is known)
+        ("", "anything")                -> True   (empty brand)
+    """
+    if not brand_norm or not brand_norm.strip():
+        return True
+
+    # If the brand is already a known canonical brand, trust it.
+    if brand_norm.lower() in known_canonical_brands():
+        return False
+
+    # Brand is unknown — check if the title contains a better-known one.
+    title_brand = extract_brand_from_title(raw_title)
+    if title_brand and title_brand.lower() != brand_norm.lower():
+        return True
+
+    return False
