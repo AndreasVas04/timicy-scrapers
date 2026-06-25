@@ -1,8 +1,8 @@
 """
 test_union_find.py
 ------------------
-Unit tests for the generic UnionFind data structure and the tier-2
-(mpn_root) edge provider.
+Unit tests for the generic UnionFind data structure, the tier-2
+(mpn_root) edge provider, and the tier-3 (reliable MPN) edge provider.
 
 Uses small synthetic fixtures — does not hit the database.
 
@@ -17,6 +17,7 @@ import unittest
 from matching.union_find import UnionFind
 from matching.load import EnrichedOffer
 from matching.tier_mpn_root import mpn_root_edges, mpn_root_groups
+from matching.tier_mpn import reliable_mpn_edges, reliable_mpn_groups
 
 
 # ---------------------------------------------------------------------------
@@ -27,13 +28,20 @@ from matching.tier_mpn_root import mpn_root_edges, mpn_root_groups
 
 def _offer(
     mpn_root_key: str | None = None,
+    mpn_key: str | None = None,
+    identifier_source: str = "none",
     store: str = "teststore",
     category: str = "smartphones",
     brand_norm: str = "TestBrand",
     title: str = "Test Product",
     vendor: str | None = "TestVendor",
 ) -> EnrichedOffer:
-    """Build a minimal EnrichedOffer with only the fields tier-2 cares about."""
+    """Build a minimal EnrichedOffer for tier-2 and tier-3 testing.
+
+    Accepts mpn_root_key (tier 2), mpn_key + identifier_source (tier 3),
+    and a few other fields needed for cluster inspection. Everything else
+    gets safe defaults.
+    """
     return EnrichedOffer(
         store=store,
         store_product_id="sp-001",
@@ -48,13 +56,13 @@ def _offer(
         mpn=None,
         mpn_root=None,
         ean=None,
-        identifier_source="none",
+        identifier_source=identifier_source,
         brand_norm=brand_norm,
         title_norm="test product",
         title_key="title:testbrand:smartphones:abc123abc123",
         ean_key=None,
         mpn_root_key=mpn_root_key,
-        mpn_key=None,
+        mpn_key=mpn_key,
         model_codes=(),
         is_suspicious_brand=False,
         brand_from_title=None,
@@ -312,6 +320,170 @@ class TestMpnRootEdges(unittest.TestCase):
         self.assertFalse(uf.connected(0, 1))
         self.assertFalse(uf.connected(0, 3))
         self.assertFalse(uf.connected(1, 3))
+
+
+# ===========================================================================
+# Tier-3 (reliable MPN) tests
+# ===========================================================================
+
+class TestReliableMpnGroups(unittest.TestCase):
+    """reliable_mpn_groups respects the reliability gate and groups correctly."""
+
+    def test_sku_source_grouped(self):
+        """Offers with identifier_source='sku' and shared mpn_key are grouped."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),   # 0
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),   # 1
+        ]
+        groups = reliable_mpn_groups(offers)
+        self.assertEqual(groups["mpn:samsung:SM-S928B"], [0, 1])
+
+    def test_api_source_grouped(self):
+        """Offers with identifier_source='api' and shared mpn_key are grouped."""
+        offers = [
+            _offer(mpn_key="mpn:apple:MU7A3GH/A", identifier_source="api"),   # 0
+            _offer(mpn_key="mpn:apple:MU7A3GH/A", identifier_source="api"),   # 1
+        ]
+        groups = reliable_mpn_groups(offers)
+        self.assertEqual(groups["mpn:apple:MU7A3GH/A"], [0, 1])
+
+    def test_mixed_reliable_sources_grouped(self):
+        """Offers with 'sku' and 'api' sharing the same mpn_key are grouped."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),   # 0
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="api"),   # 1
+        ]
+        groups = reliable_mpn_groups(offers)
+        self.assertEqual(groups["mpn:samsung:SM-S928B"], [0, 1])
+
+    def test_title_regex_excluded(self):
+        """Offers with identifier_source='title_regex' are excluded entirely."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="title_regex"),  # 0
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),           # 1
+        ]
+        groups = reliable_mpn_groups(offers)
+        # Only index 1 should be in the group (singleton, no edge).
+        self.assertEqual(groups["mpn:samsung:SM-S928B"], [1])
+
+    def test_none_source_excluded(self):
+        """Offers with identifier_source='none' are excluded."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="none"),  # 0
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),   # 1
+        ]
+        groups = reliable_mpn_groups(offers)
+        self.assertEqual(groups["mpn:samsung:SM-S928B"], [1])
+
+    def test_empty_source_excluded(self):
+        """Offers with empty identifier_source are excluded."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source=""),      # 0
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),   # 1
+        ]
+        groups = reliable_mpn_groups(offers)
+        self.assertEqual(groups["mpn:samsung:SM-S928B"], [1])
+
+    def test_empty_mpn_key_excluded(self):
+        """Offers passing source gate but with empty/None mpn_key are excluded."""
+        offers = [
+            _offer(mpn_key=None, identifier_source="sku"),    # 0
+            _offer(mpn_key="", identifier_source="api"),      # 1
+            _offer(mpn_key="mpn:samsung:X", identifier_source="sku"),  # 2
+        ]
+        groups = reliable_mpn_groups(offers)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups["mpn:samsung:X"], [2])
+
+    def test_deterministic_output(self):
+        """Same input produces identical group output on repeated calls."""
+        offers = [
+            _offer(mpn_key="mpn:b:Z", identifier_source="sku"),
+            _offer(mpn_key="mpn:a:A", identifier_source="api"),
+            _offer(mpn_key="mpn:b:Z", identifier_source="sku"),
+        ]
+        g1 = reliable_mpn_groups(offers)
+        g2 = reliable_mpn_groups(offers)
+        self.assertEqual(g1, g2)
+        # Keys should be sorted.
+        self.assertEqual(list(g1.keys()), sorted(g1.keys()))
+
+
+class TestReliableMpnEdges(unittest.TestCase):
+    """reliable_mpn_edges returns correct star-pattern edges with gate."""
+
+    def test_reliable_pair_produces_edge(self):
+        """Two reliable offers sharing mpn_key produce one edge."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="api"),
+        ]
+        edges = reliable_mpn_edges(offers)
+        self.assertEqual(edges, [(0, 1)])
+
+    def test_unreliable_not_pulled_in(self):
+        """An unreliable offer sharing an mpn_key with a reliable one is NOT
+        pulled into the group. Only reliable offers produce edges."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="title_regex"),  # 0
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),           # 1
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="none"),          # 2
+        ]
+        edges = reliable_mpn_edges(offers)
+        # Only index 1 passes the gate -> singleton -> no edges.
+        self.assertEqual(edges, [])
+
+    def test_no_edges_from_none_keys(self):
+        """Reliable source but None/empty mpn_key -> no edges."""
+        offers = [
+            _offer(mpn_key=None, identifier_source="sku"),
+            _offer(mpn_key=None, identifier_source="api"),
+        ]
+        edges = reliable_mpn_edges(offers)
+        self.assertEqual(edges, [])
+
+    def test_star_pattern_three(self):
+        """Three reliable offers -> star edges from smallest index."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="api"),
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),
+        ]
+        edges = reliable_mpn_edges(offers)
+        self.assertEqual(edges, [(0, 1), (0, 2)])
+
+    def test_edges_applied_to_union_find(self):
+        """Tier-3 edges correctly union reliable offers in a UnionFind."""
+        offers = [
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="sku"),           # 0
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="title_regex"),   # 1
+            _offer(mpn_key="mpn:samsung:SM-S928B", identifier_source="api"),           # 2
+            _offer(mpn_key="mpn:apple:MU7A3GH/A", identifier_source="sku"),           # 3
+        ]
+        edges = reliable_mpn_edges(offers)
+        uf = UnionFind(len(offers))
+        for a, b in edges:
+            uf.union(a, b)
+
+        # 0 and 2 should be connected (both reliable, same mpn_key).
+        self.assertTrue(uf.connected(0, 2))
+        # 1 is unreliable and must NOT be connected to anything.
+        self.assertFalse(uf.connected(0, 1))
+        self.assertFalse(uf.connected(1, 2))
+        # 3 has a different mpn_key -> isolated.
+        self.assertFalse(uf.connected(0, 3))
+
+    def test_deterministic_edges(self):
+        """Same input produces identical edge list across calls."""
+        offers = [
+            _offer(mpn_key="mpn:b:Z", identifier_source="sku"),
+            _offer(mpn_key="mpn:a:A", identifier_source="api"),
+            _offer(mpn_key="mpn:b:Z", identifier_source="sku"),
+            _offer(mpn_key="mpn:a:A", identifier_source="api"),
+        ]
+        e1 = reliable_mpn_edges(offers)
+        e2 = reliable_mpn_edges(offers)
+        self.assertEqual(e1, e2)
 
 
 if __name__ == "__main__":
