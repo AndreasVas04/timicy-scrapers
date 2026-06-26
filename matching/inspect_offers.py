@@ -17,6 +17,7 @@ Usage:
     python -m matching.inspect_offers --deterministic  # + tier 2+3 combined
     python -m matching.inspect_offers --model-codes    # + model-code trust analysis
     python -m matching.inspect_offers --tier4          # + tier 2+3+4 combined dry-run
+    python -m matching.inspect_offers --final          # + full deterministic pipeline (T2+T3+T4+T5)
 """
 
 import argparse
@@ -1415,6 +1416,234 @@ def section_tier4(offers: list[EnrichedOffer]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Section 11: full deterministic pipeline (behind --final flag)
+# ---------------------------------------------------------------------------
+# Applies ALL deterministic tiers (T2 mpn_root + T3 reliable_mpn + T4
+# model_code + T5 title_key) in a single UnionFind, then reports final
+# cluster statistics, title_key contribution, cross-brand/cross-category
+# checks, multi-store coverage, and method breakdown.
+
+def section_final(offers: list[EnrichedOffer]) -> None:
+    """Full deterministic pipeline: T2+T3+T4+T5 in one UnionFind.
+
+    Strictly read-only — builds clusters in memory, prints stats, no DB writes.
+    """
+    try:
+        from .tier_mpn_root import mpn_root_edges
+        from .tier_mpn import reliable_mpn_edges
+        from .tier_model_code import model_code_edges
+        from .tier_title_key import title_key_edges
+        from .union_find import UnionFind
+    except ImportError:
+        from tier_mpn_root import mpn_root_edges
+        from tier_mpn import reliable_mpn_edges
+        from tier_model_code import model_code_edges
+        from tier_title_key import title_key_edges
+        from union_find import UnionFind
+
+    n = len(offers)
+
+    # ==================================================================
+    # Apply tiers 2, 3, and 4 — snapshot before title_key for delta
+    # ==================================================================
+    uf = UnionFind(n)
+
+    t2_edges = mpn_root_edges(offers)
+    for a, b in t2_edges:
+        uf.union(a, b)
+
+    t3_edges = reliable_mpn_edges(offers)
+    for a, b in t3_edges:
+        uf.union(a, b)
+
+    t4_edges = model_code_edges(offers)
+    for a, b in t4_edges:
+        uf.union(a, b)
+
+    # Snapshot state after T2+T3+T4, before T5 (title_key).
+    pre_t5_root = [uf.find(i) for i in range(n)]
+    pre_t5_clusters = uf.groups()
+    pre_t5_ge2 = [c for c in pre_t5_clusters if len(c) >= 2]
+    pre_t5_singletons_set = {c[0] for c in pre_t5_clusters if len(c) == 1}
+
+    # ==================================================================
+    # Apply tier 5 (title_key)
+    # ==================================================================
+    t5_edges = title_key_edges(offers)
+    for a, b in t5_edges:
+        uf.union(a, b)
+
+    # ==================================================================
+    # Final cluster stats
+    # ==================================================================
+    _header("11a. Final cluster stats (T2+T3+T4+T5)")
+
+    final_clusters = uf.groups()
+    final_ge2 = [c for c in final_clusters if len(c) >= 2]
+    final_singletons = len(final_clusters) - len(final_ge2)
+
+    print(f"\n  Non-trivial clusters (size >= 2):   {len(final_ge2)}")
+    print(f"  Singletons remaining:               {final_singletons}")
+    print(f"  Total clusters:                     {len(final_clusters)}")
+
+    # ==================================================================
+    # Title_key contribution (T5 delta vs T2+T3+T4)
+    # ==================================================================
+    _header("11b. Title_key contribution (T5 delta)")
+
+    # Count how many pre-T5 clusters were bridged by title_key edges.
+    # A final cluster "bridges" pre-T5 clusters if it spans >= 2 distinct
+    # pre-T5 roots.
+    bridging_final_clusters = 0
+    bridged_pre_t5_roots: set[int] = set()
+    for cluster in final_ge2:
+        roots = {pre_t5_root[i] for i in cluster}
+        if len(roots) >= 2:
+            bridging_final_clusters += 1
+            bridged_pre_t5_roots.update(roots)
+
+    print(f"\n  Final clusters that bridge >= 2 pre-T5 clusters: "
+          f"{bridging_final_clusters}")
+    print(f"  Distinct pre-T5 clusters merged by title_key:    "
+          f"{len(bridged_pre_t5_roots)}")
+    print(f"  Title_key edges emitted: {len(t5_edges)}")
+
+    # ==================================================================
+    # Cross-brand clusters (expect 0)
+    # ==================================================================
+    _header("11c. Cross-brand clusters (by effective_brand)")
+
+    cross_brand_clusters: list[list[int]] = []
+    for cluster in final_ge2:
+        brands = {offers[i].effective_brand for i in cluster
+                  if offers[i].effective_brand}
+        if len(brands) >= 2:
+            cross_brand_clusters.append(cluster)
+
+    print(f"\n  Cross-brand clusters: {len(cross_brand_clusters)}")
+
+    if cross_brand_clusters:
+        for cluster in cross_brand_clusters:
+            brands = sorted({offers[i].effective_brand for i in cluster
+                             if offers[i].effective_brand})
+            print(f"\n  --- Cluster (size {len(cluster)}) brands={brands} ---")
+            for idx in cluster:
+                o = offers[idx]
+                print(f"    store={o.store:<12s} cat={str(o.category):<20s} "
+                      f"eff_brand={str(o.effective_brand):<15s}")
+                print(f"      title: {o.title[:120]}")
+    else:
+        print("  (Good — no false cross-brand merges.)")
+
+    # ==================================================================
+    # Cross-category clusters (expect ~4 legit Apple cases)
+    # ==================================================================
+    _header("11d. Cross-category clusters")
+
+    cross_category_clusters: list[list[int]] = []
+    for cluster in final_ge2:
+        cats = {offers[i].category for i in cluster}
+        if len(cats) >= 2:
+            cross_category_clusters.append(cluster)
+
+    print(f"\n  Cross-category clusters: {len(cross_category_clusters)}")
+
+    # Print ALL with full titles so the user can verify they are legit.
+    for cluster in cross_category_clusters:
+        cats = sorted({str(offers[i].category) for i in cluster})
+        brands = sorted({str(offers[i].effective_brand) for i in cluster
+                         if offers[i].effective_brand})
+        print(f"\n  --- Cluster (size {len(cluster)}) categories={cats} "
+              f"brands={brands} ---")
+        for idx in cluster:
+            o = offers[idx]
+            print(f"    store={o.store:<12s} cat={str(o.category):<20s} "
+                  f"eff_brand={str(o.effective_brand):<15s}")
+            print(f"      title: {o.title[:120]}")
+            print(f"      url:   {o.product_url[:120]}")
+
+    # ==================================================================
+    # Multi-store coverage and largest cluster
+    # ==================================================================
+    _header("11e. Multi-store coverage")
+
+    multi_store = sum(
+        1 for c in final_ge2
+        if len({offers[i].store for i in c}) >= 2
+    )
+    largest_size = max(len(c) for c in final_ge2) if final_ge2 else 0
+
+    print(f"\n  Multi-store clusters (>= 2 stores):  {multi_store}")
+    print(f"  Largest cluster size:                {largest_size}")
+
+    # ==================================================================
+    # Method breakdown: label each final cluster by strongest contributor
+    # ==================================================================
+    # Priority: ean > mpn_root > mpn > model_code > title_key.
+    # For each cluster, check whether ANY edge from a given tier contributed
+    # to its formation. The highest-priority tier with at least one edge
+    # inside the cluster determines its label.
+    _header("11f. Method breakdown (strongest contributing tier per cluster)")
+
+    # Build sets of offer-index pairs connected by each tier, for quick lookup.
+    # We store frozensets of pairs so lookup is O(1).
+    ean_pairs: set[frozenset[int]] = set()
+    t2_pair_set: set[frozenset[int]] = {frozenset(e) for e in t2_edges}
+    t3_pair_set: set[frozenset[int]] = {frozenset(e) for e in t3_edges}
+    t4_pair_set: set[frozenset[int]] = {frozenset(e) for e in t4_edges}
+    t5_pair_set: set[frozenset[int]] = {frozenset(e) for e in t5_edges}
+
+    # EAN tier (tier 1): offers sharing the same ean_key are implicitly
+    # connected. Build explicit pairs for clusters where ean_key matches.
+    ean_groups: dict[str, list[int]] = defaultdict(list)
+    for idx, o in enumerate(offers):
+        if o.ean_key:
+            ean_groups[o.ean_key].append(idx)
+    for _key, members in ean_groups.items():
+        if len(members) >= 2:
+            for m in members[1:]:
+                ean_pairs.add(frozenset([members[0], m]))
+
+    method_counts: Counter = Counter()
+
+    for cluster in final_ge2:
+        # Build all index pairs within the cluster to check against tier edges.
+        # For large clusters this is O(n^2), but largest is ~30 so it's fine.
+        cluster_pairs: set[frozenset[int]] = set()
+        cluster_list = list(cluster)
+        for i in range(len(cluster_list)):
+            for j in range(i + 1, len(cluster_list)):
+                cluster_pairs.add(frozenset([cluster_list[i], cluster_list[j]]))
+
+        # Check tiers in priority order — first match wins.
+        if cluster_pairs & ean_pairs:
+            method_counts["ean"] += 1
+        elif cluster_pairs & t2_pair_set:
+            method_counts["mpn_root"] += 1
+        elif cluster_pairs & t3_pair_set:
+            method_counts["mpn"] += 1
+        elif cluster_pairs & t4_pair_set:
+            method_counts["model_code"] += 1
+        elif cluster_pairs & t5_pair_set:
+            method_counts["title_key"] += 1
+        else:
+            # Should not happen — every cluster with size >= 2 must have
+            # at least one edge from some tier.
+            method_counts["unknown"] += 1
+
+    print(f"\n  Method labeling: each cluster is tagged by its highest-priority")
+    print(f"  contributing tier (ean > mpn_root > mpn > model_code > title_key).\n")
+
+    rows = []
+    for method in ["ean", "mpn_root", "mpn", "model_code", "title_key", "unknown"]:
+        cnt = method_counts.get(method, 0)
+        rows.append([method, cnt, _pct(cnt, len(final_ge2))])
+    _table(["method", "clusters", "%"], rows, align=["<", ">", ">"])
+
+    print(f"\n  Total non-trivial clusters: {len(final_ge2)}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1443,6 +1672,11 @@ def main() -> None:
         action="store_true",
         help="Run combined tier 2+3+4 dry-run clustering.",
     )
+    parser.add_argument(
+        "--final",
+        action="store_true",
+        help="Run full deterministic pipeline (T2+T3+T4+T5 title_key).",
+    )
     args = parser.parse_args()
 
     conn = None
@@ -1470,6 +1704,8 @@ def main() -> None:
         section_model_codes(offers)
     if args.tier4:
         section_tier4(offers)
+    if args.final:
+        section_final(offers)
 
     print()
     print("Done. This script performed read-only queries only.")
