@@ -17,13 +17,24 @@ import json
 import sys
 from pathlib import Path
 
-from .normalize import (
-    extract_brand_from_title,
-    extract_model_codes,
-    looks_suspicious_brand,
-    normalize_brand,
-    normalize_title,
-)
+# Support running both as a package module (-m matching.inspect_normalization)
+# and directly (python3 matching/inspect_normalization.py).
+try:
+    from .normalize import (
+        extract_brand_from_title,
+        extract_model_codes,
+        looks_suspicious_brand,
+        normalize_brand,
+        normalize_title,
+    )
+except ImportError:
+    from normalize import (
+        extract_brand_from_title,
+        extract_model_codes,
+        looks_suspicious_brand,
+        normalize_brand,
+        normalize_title,
+    )
 
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
