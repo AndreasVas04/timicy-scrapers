@@ -36,7 +36,10 @@ BRAND_ALIASES: dict[str, str] = {
     "SONY": "Sony",
 
     # Xiaomi
+    # "Xiaomi Mijia" is a home/IoT sub-brand of Xiaomi; collapsing it keeps
+    # Mijia-branded products in the same block as other Xiaomi products.
     "XIAOMI": "Xiaomi",
+    "XIAOMIMIJIA": "Xiaomi",
     "MI": "Xiaomi",
     "REDMI": "Xiaomi",
     "POCO": "Xiaomi",
@@ -89,7 +92,11 @@ BRAND_ALIASES: dict[str, str] = {
     "NESPRESSO": "Nespresso",
 
     # Philips
+    # "Philips Hue" is a smart-lighting sub-brand of Philips; collapsing it
+    # ensures Hue products land in the same (category, effective_brand) block
+    # as other Philips products for matching purposes.
     "PHILIPS": "Philips",
+    "PHILIPSHUE": "Philips",
 
     # Bosch
     "BOSCH": "Bosch",
@@ -153,7 +160,13 @@ BRAND_ALIASES: dict[str, str] = {
     "HISENSE": "Hisense",
 
     # Logitech
+    # "Logitech G" is the gaming sub-brand of Logitech; collapsing it ensures
+    # gaming peripherals land in the same block as other Logitech products.
+    # Note: the lookup key "LOGITECHG" matches only the exact brand string
+    # "Logitech G" — a product code like "Logitech G502" produces key
+    # "LOGITECHG502" which does NOT match, so no false positives.
     "LOGITECH": "Logitech",
+    "LOGITECHG": "Logitech",
 
     # Marshall
     "MARSHALL": "Marshall",

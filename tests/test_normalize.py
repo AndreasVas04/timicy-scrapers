@@ -66,6 +66,44 @@ class TestNormalizeBrand(unittest.TestCase):
         self.assertEqual(normalize_brand("   "), "")
 
 
+class TestSubBrandAliases(unittest.TestCase):
+    """Sub-brand aliases: known sub-brands collapse to their parent brand.
+
+    The lookup is exact on the fully-normalized key (uppercase, non-alphanumeric
+    stripped), so "Logitech G" (key LOGITECHG) matches but "Logitech G502"
+    (key LOGITECHG502) does not.
+    """
+
+    def test_philips_hue_collapses_to_philips(self):
+        self.assertEqual(normalize_brand("Philips Hue"), normalize_brand("Philips"))
+
+    def test_xiaomi_mijia_collapses_to_xiaomi(self):
+        self.assertEqual(normalize_brand("Xiaomi Mijia"), normalize_brand("Xiaomi"))
+
+    def test_logitech_g_collapses_to_logitech(self):
+        self.assertEqual(normalize_brand("Logitech G"), normalize_brand("Logitech"))
+
+    def test_parent_brands_unchanged(self):
+        """Parent brands still normalize to their own canonical value."""
+        self.assertEqual(normalize_brand("Philips"), "Philips")
+        self.assertEqual(normalize_brand("Xiaomi"), "Xiaomi")
+        self.assertEqual(normalize_brand("Logitech"), "Logitech")
+
+    def test_logitech_g502_not_collapsed(self):
+        """'Logitech G502' must NOT collapse to 'Logitech' — it is a product
+        code, not the sub-brand 'Logitech G'."""
+        self.assertNotEqual(normalize_brand("Logitech G502"),
+                            normalize_brand("Logitech"))
+
+    def test_idempotency(self):
+        """normalize_brand(normalize_brand(x)) == normalize_brand(x) for
+        sub-brand aliases."""
+        for raw in ("Philips Hue", "Xiaomi Mijia", "Logitech G"):
+            once = normalize_brand(raw)
+            twice = normalize_brand(once)
+            self.assertEqual(once, twice, f"not idempotent for {raw!r}")
+
+
 class TestStripAccents(unittest.TestCase):
     """Greek accent removal and final-sigma unification."""
 
