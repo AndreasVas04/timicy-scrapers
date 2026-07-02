@@ -12,16 +12,29 @@ import hashlib
 import re
 import unicodedata
 
-from .lexicons import BRAND_ALIASES, COLOR_WORDS, STORE_NOISE
+from .lexicons import BRAND_ALIASES, COLOR_WORDS, PRODUCT_LINE_ALIAS_KEYS, STORE_NOISE
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+# Greek capital letters that are visual homoglyphs of Latin capitals.
+# Transliterating these before the [^A-Z0-9] strip lets vendor strings like
+# "ΧΙΑΟΜΙ" (Greek Chi-Iota-Alpha-Omicron-Mu-Iota) resolve to "XIAOMI" and
+# hit the existing Xiaomi alias instead of producing an empty lookup key.
+_GREEK_HOMOGLYPH_TABLE = str.maketrans(
+    "\u0391\u0392\u0395\u0396\u0397\u0399\u039A\u039C\u039D\u039F\u03A1\u03A4\u03A5\u03A7",
+    "ABEZHIKMNOPTYX",
+)
+
+
 def _make_lookup_key(text: str) -> str:
-    """Build a brand-lookup key: uppercase, strip every non-alphanumeric char."""
-    return re.sub(r"[^A-Z0-9]", "", text.upper())
+    """Build a brand-lookup key: uppercase, transliterate Greek homoglyphs,
+    then strip every non-alphanumeric char."""
+    upper = text.upper()
+    upper = upper.translate(_GREEK_HOMOGLYPH_TABLE)
+    return re.sub(r"[^A-Z0-9]", "", upper)
 
 
 # Pre-compile the sorted color patterns (longest first so multi-word phrases
@@ -216,6 +229,11 @@ def normalize_title(raw_title: str | None, brand_norm: str = "") -> str:
         # common hyphen/space variants derived from the title text.
         for alias_key, canonical in BRAND_ALIASES.items():
             if canonical == brand_norm:
+                # Skip product-line aliases — these tokens ("iphone",
+                # "galaxy", etc.) are discriminative model info that must
+                # remain in the title to keep match_keys stable.
+                if alias_key in PRODUCT_LINE_ALIAS_KEYS:
+                    continue
                 alias_lower = alias_key.lower()
                 alias_pat = re.compile(
                     r"(?<!\w)" + re.escape(alias_lower) + r"(?!\w)"

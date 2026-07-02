@@ -220,7 +220,48 @@ BRAND_ALIASES: dict[str, str] = {
 
     # Pro-Mounts
     "PROMOUNTS": "Pro-Mounts",
+
+    # Bowers & Wilkins
+    "BOWERSWILKINS": "Bowers & Wilkins",
+    "BW": "Bowers & Wilkins",
+
+    # Fresh 'n Rebel
+    "FRESHNREBEL": "Fresh 'n Rebel",
+
+    # OTL
+    "OTL": "OTL",
+
+    # -----------------------------------------------------------------------
+    # Vendor-data defect aliases
+    # -----------------------------------------------------------------------
+    # These map real-world vendor-data defects — typos, HTML entity artefacts,
+    # and product lines incorrectly used as the vendor name — to the correct
+    # canonical brand.  Each entry was observed in production scraper output.
+    "PHLIPS": "Philips",                       # vendor typo (Electroline)
+    "BANGAMPOLUFSENBAMPO": "Bang & Olufsen",   # HTML &amp; entities (Stephanis)
+    "BOWERSAMPWILKINSBAMPW": "Bowers & Wilkins",  # HTML &amp; entities (Stephanis)
+    "FRESHANDREBEL": "Fresh 'n Rebel",         # "FRESH AND REBEL" variant (Public)
+    "OTLTECHNOLOGIES": "OTL",                  # "OTL Technologies" variant
+    "IPHONE": "Apple",                         # product line used as vendor (Electroline)
+    "AIRPODS": "Apple",                        # product line used as vendor
+    "GALAXY": "Samsung",                       # product line used as vendor
 }
+
+# ---------------------------------------------------------------------------
+# Product-line alias keys that must NOT be stripped from titles
+# ---------------------------------------------------------------------------
+# These lookup keys map product lines used as vendor values (e.g. "IPHONE" →
+# "Apple") to their real brand for vendor resolution.  However, the tokens
+# themselves are discriminative product-model information ("iphone", "airpods",
+# "galaxy") and must NEVER be stripped from titles — stripping them would
+# change normalized_title and destabilize existing match_keys.
+#
+# REDMI is intentionally NOT in this set — it predates this change and
+# existing keys already reflect its stripping.
+# ---------------------------------------------------------------------------
+PRODUCT_LINE_ALIAS_KEYS: frozenset[str] = frozenset({
+    "IPHONE", "AIRPODS", "GALAXY",
+})
 
 
 # ---------------------------------------------------------------------------

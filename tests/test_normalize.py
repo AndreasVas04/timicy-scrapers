@@ -104,6 +104,41 @@ class TestSubBrandAliases(unittest.TestCase):
             self.assertEqual(once, twice, f"not idempotent for {raw!r}")
 
 
+class TestVendorDataDefectAliases(unittest.TestCase):
+    """Aliases that correct real vendor-data defects observed in production:
+    typos, HTML entity artefacts, product lines used as vendor names, and
+    Greek homoglyph transliteration."""
+
+    def test_philips_typo(self):
+        """'PHLIPS' (missing 'i') maps to the Philips canonical."""
+        self.assertEqual(normalize_brand("PHLIPS"), "Philips")
+
+    def test_html_entity_bang_olufsen(self):
+        """'BANG &amp; OLUFSEN (B&amp;O)' maps to Bang & Olufsen canonical."""
+        self.assertEqual(
+            normalize_brand("BANG &amp; OLUFSEN (B&amp;O)"), "Bang & Olufsen"
+        )
+
+    def test_fresh_and_rebel_variant(self):
+        """'FRESH AND REBEL' maps to the same canonical as 'FRESH 'N REBEL'."""
+        self.assertEqual(
+            normalize_brand("FRESH AND REBEL"),
+            normalize_brand("FRESH 'N REBEL"),
+        )
+
+    def test_product_line_iphone_to_apple(self):
+        """'IPHONE' used as vendor resolves to Apple."""
+        self.assertEqual(normalize_brand("IPHONE"), "Apple")
+
+    def test_greek_homoglyph_xiaomi(self):
+        """Greek-letter 'ΧΙΑΟΜΙ' transliterates to Latin and hits Xiaomi alias."""
+        self.assertEqual(normalize_brand("\u03a7\u0399\u0391\u039f\u039c\u0399"), "Xiaomi")
+
+    def test_xiaomi_latin_unchanged(self):
+        """Regression guard: Latin 'Xiaomi' still normalizes correctly."""
+        self.assertEqual(normalize_brand("Xiaomi"), "Xiaomi")
+
+
 class TestStripAccents(unittest.TestCase):
     """Greek accent removal and final-sigma unification."""
 
@@ -488,6 +523,23 @@ class TestLooksSuspiciousBrand(unittest.TestCase):
 
     def test_whitespace_brand_suspicious(self):
         self.assertTrue(looks_suspicious_brand("   ", "some product"))
+
+
+class TestProductLineAliasNotStrippedFromTitle(unittest.TestCase):
+    """Product-line aliases (IPHONE, GALAXY, AIRPODS) resolve vendors to their
+    parent brand but must NOT be stripped from titles — they are discriminative
+    product-model tokens whose removal would change normalized_title and
+    destabilize existing match_keys."""
+
+    def test_iphone_survives_in_title(self):
+        """'iphone' must remain in the normalized title for Apple products."""
+        result = normalize_title("iPhone 16 128GB Black", "Apple")
+        self.assertIn("iphone", result)
+
+    def test_galaxy_survives_in_title(self):
+        """'galaxy' must remain in the normalized title for Samsung products."""
+        result = normalize_title("Galaxy S25 128GB Navy", "Samsung")
+        self.assertIn("galaxy", result)
 
 
 class TestMVPColorInvariance(unittest.TestCase):
