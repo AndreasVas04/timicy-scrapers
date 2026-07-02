@@ -229,6 +229,7 @@ def _select_representative(
         "match_method": match_method,
         "match_key": match_key,
         "offer_count": len(cluster),
+        "store_count": len({offers[i].store for i in cluster}),
         "min_price": min_price,
         "max_price": max_price,
         "needs_review": needs_review,
@@ -255,6 +256,7 @@ UPDATE products SET
     match_method     = %(match_method)s::match_method,
     match_key        = %(match_key)s,
     offer_count      = %(offer_count)s,
+    store_count      = %(store_count)s,
     min_price        = %(min_price)s,
     max_price        = %(max_price)s,
     needs_review     = %(needs_review)s,
@@ -504,13 +506,13 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
             category, brand, canonical_title, normalized_title,
             ean, mpn_root, mpn, image_url,
             match_method, match_key,
-            offer_count, min_price, max_price,
+            offer_count, store_count, min_price, max_price,
             needs_review, review_reason
         ) VALUES (
             %(category)s::category, %(brand)s, %(canonical_title)s, %(normalized_title)s,
             %(ean)s, %(mpn_root)s, %(mpn)s, %(image_url)s,
             %(match_method)s::match_method, %(match_key)s,
-            %(offer_count)s, %(min_price)s, %(max_price)s,
+            %(offer_count)s, %(store_count)s, %(min_price)s, %(max_price)s,
             %(needs_review)s, %(review_reason)s
         )
         """
@@ -551,6 +553,152 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
     if link_params:
         cur.executemany(_LINK_OFFER_SQL, link_params)
 
+    # -------------------------------------------------------------------
+    # 2d: Merge aftermath — repoint subscriptions, record redirects,
+    # and delete absorbed products.
+    #
+    # Runs AFTER offer links have been repointed (2c) and BEFORE the
+    # transaction is committed/rolled-back, so everything is atomic.
+    # -------------------------------------------------------------------
+    merge_decisions = [d for d in decisions if d["resolution"] == "merged"]
+
+    # Collect ALL absorbed product ids across all merge events for batched
+    # operations — avoids one-statement-per-id round-trips.
+    all_absorbed_ids: list[int] = []
+    # Map survivor -> list of absorbed ids (for per-merge operations).
+    survivor_absorbed: list[tuple[int, list[int]]] = []
+    for d in merge_decisions:
+        survivor = d["resolved_pid"]
+        absorbed = d["rep"]["review_reason"]
+        # Extract absorbed ids from the merge_details list (already computed
+        # in Phase 1).
+        absorbed_ids = [
+            md["absorbed"]
+            for md in merge_details
+            if md["survivor"] == survivor
+        ]
+        # Flatten: merge_details stores absorbed as a list of ints.
+        flat_absorbed = []
+        for a in absorbed_ids:
+            if isinstance(a, list):
+                flat_absorbed.extend(a)
+            else:
+                flat_absorbed.append(a)
+        if flat_absorbed:
+            survivor_absorbed.append((survivor, flat_absorbed))
+            all_absorbed_ids.extend(flat_absorbed)
+
+    repointed_subscriptions = 0
+    redirect_rows_written = 0
+    compressed_chain_rows = 0
+    deleted_absorbed_products = 0
+
+    if all_absorbed_ids:
+        # -- Step (a): REPOINT SUBSCRIPTIONS --
+        # For each absorbed id, move its price_subscriptions to the survivor,
+        # but only when the same (email, product_id=survivor) pair does NOT
+        # already exist.  This respects the UNIQUE(email, product_id)
+        # constraint.  Duplicate-email rows are intentionally left behind
+        # and will be removed by CASCADE when the absorbed product is
+        # deleted in step (c), keeping the older survivor-side subscription.
+        _REPOINT_SUBS_SQL = """
+            UPDATE price_subscriptions
+            SET    product_id = %(survivor)s
+            WHERE  product_id = %(absorbed)s
+              AND  NOT EXISTS (
+                  SELECT 1 FROM price_subscriptions s2
+                  WHERE  s2.email      = price_subscriptions.email
+                    AND  s2.product_id = %(survivor)s
+              )
+        """
+        repoint_params: list[dict] = []
+        for survivor, absorbed_list in survivor_absorbed:
+            for absorbed_id in absorbed_list:
+                repoint_params.append({
+                    "survivor": survivor,
+                    "absorbed": absorbed_id,
+                })
+        if repoint_params:
+            # Execute each repoint individually to accumulate accurate
+            # rowcounts (merge events are rare, so no performance concern).
+            for p in repoint_params:
+                cur.execute(_REPOINT_SUBS_SQL, p)
+                repointed_subscriptions += cur.rowcount
+
+        # -- Step (b): RECORD REDIRECTS with chain compression --
+        # Insert a mapping from each absorbed id to its survivor in
+        # merged_products.  ON CONFLICT updates the target if the absorbed
+        # id was already redirected from an earlier merge.
+        _REDIRECT_SQL = """
+            INSERT INTO merged_products (old_id, new_id)
+            VALUES (%(absorbed)s, %(survivor)s)
+            ON CONFLICT (old_id) DO UPDATE
+                SET new_id    = EXCLUDED.new_id,
+                    merged_at = now()
+        """
+        redirect_params: list[dict] = []
+        for survivor, absorbed_list in survivor_absorbed:
+            for absorbed_id in absorbed_list:
+                redirect_params.append({
+                    "absorbed": absorbed_id,
+                    "survivor": survivor,
+                })
+        if redirect_params:
+            cur.executemany(_REDIRECT_SQL, redirect_params)
+            redirect_rows_written = len(redirect_params)
+
+        # Chain compression: any earlier redirect that pointed AT an
+        # absorbed id must now point at the final survivor.  This keeps
+        # all mappings single-hop so the frontend never needs to follow
+        # chains.
+        _COMPRESS_SQL = """
+            UPDATE merged_products
+            SET    new_id    = %(survivor)s,
+                   merged_at = now()
+            WHERE  new_id    = %(absorbed)s
+        """
+        compress_params: list[dict] = []
+        for survivor, absorbed_list in survivor_absorbed:
+            for absorbed_id in absorbed_list:
+                compress_params.append({
+                    "absorbed": absorbed_id,
+                    "survivor": survivor,
+                })
+        if compress_params:
+            # Execute each compression individually to accumulate accurate
+            # rowcounts (merge events are rare, so no performance concern).
+            for p in compress_params:
+                cur.execute(_COMPRESS_SQL, p)
+                compressed_chain_rows += cur.rowcount
+
+        # -- Step (c): DELETE ABSORBED PRODUCTS --
+        # Safety assertion: verify no store_products rows still reference
+        # absorbed ids.  If any do, it means offers were not fully
+        # repointed in step 2c — abort the entire transaction rather than
+        # leaving orphan references.
+        cur.execute(
+            "SELECT COUNT(*) FROM store_products WHERE product_id = ANY(%s)",
+            (all_absorbed_ids,),
+        )
+        dangling_count = cur.fetchone()[0]
+        if dangling_count != 0:
+            raise RuntimeError(
+                f"ABORTING: {dangling_count} store_products row(s) still "
+                f"reference absorbed product ids {all_absorbed_ids}. "
+                f"Offers must be repointed before deleting absorbed products."
+            )
+
+        # Safe to delete: offers repointed (2c), subscriptions repointed
+        # (a), redirects recorded (b).  The FK from merged_products.new_id
+        # references products(id) — new_id always points at the survivor
+        # which continues to exist.  price_subscriptions CASCADE removes
+        # only the duplicate-email rows intentionally left behind in (a).
+        cur.execute(
+            "DELETE FROM products WHERE id = ANY(%s)",
+            (all_absorbed_ids,),
+        )
+        deleted_absorbed_products = cur.rowcount
+
     print("  SQL execution complete.")
 
     # ===================================================================
@@ -565,11 +713,17 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
         print(f"  Existing products before:    {existing_product_count}")
 
     _header("Identity resolution counts")
-    print(f"\n  created_new:          {created_new}")
-    print(f"  attached_existing:    {attached_existing}")
-    print(f"  merge_events:         {merge_events}")
-    print(f"  repointed_offers:     {repointed_offers}")
-    print(f"  unchanged_offers:     {unchanged_offers}")
+    print(f"\n  created_new:              {created_new}")
+    print(f"  attached_existing:        {attached_existing}")
+    print(f"  merge_events:             {merge_events}")
+    print(f"  repointed_offers:         {repointed_offers}")
+    print(f"  unchanged_offers:         {unchanged_offers}")
+
+    _header("Merge aftermath")
+    print(f"\n  repointed_subscriptions:  {repointed_subscriptions}")
+    print(f"  redirect_rows_written:    {redirect_rows_written}")
+    print(f"  compressed_chain_rows:    {compressed_chain_rows}")
+    print(f"  deleted_absorbed_products:{deleted_absorbed_products}")
 
     _header("Review flags")
     print(f"\n  needs_review total:   {needs_review_total}")
@@ -599,7 +753,7 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
         for md in merge_details[:max_samples]:
             print(f"\n  match_key: {md['match_key']}")
             print(f"    survivor: {md['survivor']}")
-            print(f"    absorbed: {md['absorbed']}")
+            print(f"    absorbed: {md['absorbed']}  (deleted)")
             print(f"    members: {md['member_count']}, stores: {md['stores']}")
 
     # -- Final commit/rollback decision. --
