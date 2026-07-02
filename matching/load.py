@@ -107,9 +107,16 @@ def _build_offer(row: dict) -> EnrichedOffer:
     # ean_key returns "" for invalid EANs; normalize to None.
     e_key = ean_key(raw_ean or "") or None
 
-    # mpn_root_key and mpn_key return "" when components are missing.
-    mr_key = mpn_root_key(brand_norm, raw_mpn_root or "") or None
-    m_key = mpn_key(brand_norm, raw_mpn or "") or None
+    # mpn_root_key and mpn_key use effective_brand (the trusted brand
+    # resolution) instead of raw brand_norm.  The vendor field is unreliable
+    # at several stores (null vendors, typos like "PHLIPS", product lines
+    # used as vendor).  effective_brand is the same trusted resolution that
+    # model_code and title tiers consume: the vendor-derived brand when
+    # trustworthy, otherwise the brand extracted from the title.  Building
+    # all identity keys from the same trusted brand ensures offers with
+    # defective vendor data are not invisible to identifier-based matching.
+    mr_key = mpn_root_key(effective_brand or "", raw_mpn_root or "") or None
+    m_key = mpn_key(effective_brand or "", raw_mpn or "") or None
 
     # -- Model-code extraction --
     codes = extract_model_codes(raw_title or "")
