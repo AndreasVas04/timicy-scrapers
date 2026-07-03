@@ -495,7 +495,112 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
             "rep": rep,
             "member_keys": member_keys,
             "match_method": match_method,
+            # Offer-index list for this cluster, needed by the collision-merge
+            # step to recompute representative fields over the union of offers.
+            "cluster": cluster,
         })
+
+    # -------------------------------------------------------------------
+    # PHASE 1b: Collision-merge — deduplicate decisions that target the
+    # same resolved_pid.
+    #
+    # WHY collisions happen: as the matching pipeline evolves (tiers are
+    # added, removed, or reweighted), a cluster that previously grouped
+    # N offers under one product_id may now be split into several smaller
+    # clusters.  Each sub-cluster independently resolves to the SAME
+    # existing product_id via the store_products lookup, so without this
+    # step Phase 2 would execute _UPDATE_PRODUCT_SQL multiple times for
+    # that id.  Last write wins, and the aggregates (offer_count,
+    # store_count, min_price, max_price, has_available_offer) would
+    # reflect only one arbitrary sub-cluster instead of all offers that
+    # still belong to this product.
+    #
+    # Fix: detect resolved_pid collisions among non-"new" decisions,
+    # merge all colliding decisions into a single decision whose
+    # representative fields are recomputed over the UNION of their
+    # offer indices, so each product_id receives exactly one UPDATE.
+    # -------------------------------------------------------------------
+
+    # Group non-"new" decisions by resolved_pid to find collisions.
+    # "new" decisions have resolved_pid=None (assigned later in Phase 2a),
+    # so they cannot collide and are excluded.
+    pid_to_dindices: dict[int, list[int]] = defaultdict(list)
+    for di, d in enumerate(decisions):
+        if d["resolution"] != "new" and d["resolved_pid"] is not None:
+            pid_to_dindices[d["resolved_pid"]].append(di)
+
+    collided_products = 0
+    # Indices of decisions absorbed into a merged decision; removed below.
+    absorbed_decision_indices: set[int] = set()
+
+    for pid, d_indices in pid_to_dindices.items():
+        if len(d_indices) <= 1:
+            continue  # No collision for this product_id.
+
+        collided_products += 1
+
+        # -- Pick the winning sub-cluster --
+        # Primary: largest member list (most offers).
+        # Tie-break: earliest position in the decisions list, which is
+        # deterministic because clusters derive from a stable offer order.
+        winner_di = min(
+            d_indices,
+            key=lambda di: (-len(decisions[di]["cluster"]), di),
+        )
+        winning = decisions[winner_di]
+
+        # -- Build the union of offer indices and member keys --
+        union_cluster: list[int] = []
+        union_member_keys: list[tuple[str, str]] = []
+        for di in d_indices:
+            union_cluster.extend(decisions[di]["cluster"])
+            union_member_keys.extend(decisions[di]["member_keys"])
+
+        # -- Recompute representative fields over the full union --
+        # Uses the winning decision's match_method, match_key, and
+        # contributing tiers so the canonical row reflects the best
+        # available proposal.
+        rep = _select_representative(
+            union_cluster, offers,
+            winning["match_method"],
+            winning["rep"]["match_key"],
+            cluster_contribs[winning["ci"]],
+        )
+
+        # Preserve the resolved product_id and flag for human review.
+        rep["product_id"] = pid
+        rep["needs_review"] = True
+        collision_reason = (
+            f"split-cluster reattachment: {len(d_indices)} clusters"
+        )
+        if rep["review_reason"]:
+            rep["review_reason"] += f"; {collision_reason}"
+        else:
+            rep["review_reason"] = collision_reason
+
+        # Replace all colliding decisions with a single merged decision
+        # placed at the winner's position; mark the rest for removal.
+        decisions[winner_di] = {
+            "ci": winning["ci"],
+            "resolution": "collision_merged",
+            "resolved_pid": pid,
+            "rep": rep,
+            "member_keys": union_member_keys,
+            "match_method": winning["match_method"],
+            "cluster": union_cluster,
+        }
+        for di in d_indices:
+            if di != winner_di:
+                absorbed_decision_indices.add(di)
+
+    # Remove absorbed decisions so Phase 2 sees exactly one decision per
+    # product_id.  "collision_merged" resolution is != "new", so it flows
+    # into update_decisions automatically.
+    if absorbed_decision_indices:
+        decisions = [
+            d for di, d in enumerate(decisions)
+            if di not in absorbed_decision_indices
+        ]
 
     # -----------------------------------------------------------------------
     # PHASE 2: Execute all SQL in batches using executemany (pipelined by
@@ -728,6 +833,7 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
     print(f"  merge_events:             {merge_events}")
     print(f"  repointed_offers:         {repointed_offers}")
     print(f"  unchanged_offers:         {unchanged_offers}")
+    print(f"  collided_products:        {collided_products}")
 
     # -- Availability summary --
     # Count how many clusters have / lack at least one available offer.
