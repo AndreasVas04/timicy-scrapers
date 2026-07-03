@@ -37,6 +37,30 @@ def _make_lookup_key(text: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", upper)
 
 
+# Regex matching any character in the Greek and Greek Extended Unicode blocks.
+# Used by _has_untransliterated_greek to reject partially-transliterable
+# tokens before brand lookup (see extract_brand_from_title).
+_RE_GREEK_BLOCK = re.compile(r"[\u0370-\u03FF\u1F00-\u1FFF]")
+
+
+def _has_untransliterated_greek(text: str) -> bool:
+    """Return True if *text* still contains Greek-block characters after
+    uppercasing and applying the homoglyph transliteration table.
+
+    This catches partially-mappable Greek tokens like "Πλήρως" (uppercase
+    ΠΛΗΡΩΣ) where only a subset of letters have Latin homoglyphs (Η→H,
+    Ρ→P).  The remaining Greek letters (Π, Λ, Ω, Σ) would be silently
+    stripped by _make_lookup_key's [^A-Z0-9] regex, producing a spurious
+    residue (e.g. "HP") that could false-match a real brand alias.
+
+    Fully-mappable tokens like "ΧΙΑΟΜΙ" (all letters have homoglyphs) pass
+    this check and are correctly transliterated to "XIAOMI".
+    """
+    upper = text.upper()
+    upper = upper.translate(_GREEK_HOMOGLYPH_TABLE)
+    return bool(_RE_GREEK_BLOCK.search(upper))
+
+
 # Pre-compile the sorted color patterns (longest first so multi-word phrases
 # like "space gray" are removed before the single word "gray").
 # Each pattern is word-boundary aware to avoid corrupting other words.
@@ -510,6 +534,13 @@ def extract_brand_from_title(raw_title: str | None) -> str | None:
     tokens = text.split()
 
     for tok in tokens:
+        # Skip tokens that contain Greek characters which survive homoglyph
+        # transliteration.  Such tokens are only partially mappable to Latin
+        # (e.g. "Πλήρως" → residue "HP") and would produce spurious brand
+        # matches.  Fully-mappable Greek tokens (e.g. "ΧΙΑΟΜΙ" → "XIAOMI")
+        # pass this check and are correctly looked up.
+        if _has_untransliterated_greek(tok):
+            continue
         key = _make_lookup_key(tok)
         if key and key in BRAND_ALIASES:
             return BRAND_ALIASES[key]

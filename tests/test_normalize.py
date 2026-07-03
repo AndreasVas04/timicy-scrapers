@@ -501,6 +501,24 @@ class TestExtractBrandFromTitle(unittest.TestCase):
     def test_none_input(self):
         self.assertIsNone(extract_brand_from_title(None))
 
+    def test_partial_greek_token_does_not_resolve_to_hp(self):
+        """'Πλήρως' (uppercase ΠΛΗΡΩΣ) is only partially transliterable:
+        Η→H, Ρ→P survive, but Π, Λ, Ω, Σ are stripped, leaving the
+        residue 'HP' — a known brand alias.  The fix skips tokens that
+        still contain Greek characters after homoglyph transliteration,
+        so no spurious brand is returned for this NEFF dishwasher title."""
+        result = extract_brand_from_title(
+            "NEFF S197TCX00E για 14 Σερβίτσια WiFi Πλήρως Εντοιχιζόμενο"
+            " Πλυντήριο Πιάτων"
+        )
+        self.assertIsNone(result)
+
+    def test_fully_mappable_greek_brand_still_works(self):
+        """Regression guard: 'ΧΙΑΟΜΙ' is fully transliterable to 'XIAOMI'
+        and must still resolve to the Xiaomi canonical brand."""
+        result = extract_brand_from_title("Αποχυμωτής ΧΙΑΟΜΙ 150W")
+        self.assertEqual(result, "Xiaomi")
+
 
 class TestLooksSuspiciousBrand(unittest.TestCase):
     """Brand-trust flag: detect likely-wrong vendor-derived brands."""
@@ -523,6 +541,30 @@ class TestLooksSuspiciousBrand(unittest.TestCase):
 
     def test_whitespace_brand_suspicious(self):
         self.assertTrue(looks_suspicious_brand("   ", "some product"))
+
+    def test_neff_not_suspicious_with_greek_title(self):
+        """NEFF is not in BRAND_ALIASES, but no spurious brand should be
+        extracted from a Greek title containing partially-transliterable
+        tokens like 'Πλήρως'.  Without the fix, 'Πλήρως' would produce
+        the residue 'HP' and flag NEFF as suspicious."""
+        self.assertFalse(
+            looks_suspicious_brand(
+                "NEFF",
+                "NEFF S875EMX05E για 10 Σερβίτσια Πλήρως Εντοιχιζόμενο"
+                " Πλυντήριο Πιάτων",
+            )
+        )
+
+    def test_unknown_vendor_still_flagged_when_real_brand_in_title(self):
+        """Existing behavior preserved: an unknown vendor (SSJ) is still
+        flagged as suspicious when the title contains a real brand
+        (Sencor)."""
+        self.assertTrue(
+            looks_suspicious_brand(
+                "SSJ",
+                "Αποχυμωτής Αργής Σύνθλιψης Sencor ssj4050np",
+            )
+        )
 
 
 class TestProductLineAliasNotStrippedFromTitle(unittest.TestCase):
