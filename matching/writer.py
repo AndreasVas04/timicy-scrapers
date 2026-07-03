@@ -215,6 +215,12 @@ def _select_representative(
     min_price = min(prices) if prices else None
     max_price = max(prices) if prices else None
 
+    # -- Availability flag --
+    # True when at least one offer in the cluster is currently available
+    # (i.e. in stock / purchasable).  Recomputed on every writer run so the
+    # products table always reflects the latest store_products.available state.
+    has_available_offer = any(offers[i].available for i in cluster)
+
     review_reason = "; ".join(review_reasons) if review_reasons else None
 
     return {
@@ -232,6 +238,7 @@ def _select_representative(
         "store_count": len({offers[i].store for i in cluster}),
         "min_price": min_price,
         "max_price": max_price,
+        "has_available_offer": has_available_offer,
         "needs_review": needs_review,
         "review_reason": review_reason,
     }
@@ -259,6 +266,7 @@ UPDATE products SET
     store_count      = %(store_count)s,
     min_price        = %(min_price)s,
     max_price        = %(max_price)s,
+    has_available_offer = %(has_available_offer)s,
     needs_review     = %(needs_review)s,
     review_reason    = %(review_reason)s,
     updated_at       = now()
@@ -507,12 +515,14 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
             ean, mpn_root, mpn, image_url,
             match_method, match_key,
             offer_count, store_count, min_price, max_price,
+            has_available_offer,
             needs_review, review_reason
         ) VALUES (
             %(category)s::category, %(brand)s, %(canonical_title)s, %(normalized_title)s,
             %(ean)s, %(mpn_root)s, %(mpn)s, %(image_url)s,
             %(match_method)s::match_method, %(match_key)s,
             %(offer_count)s, %(store_count)s, %(min_price)s, %(max_price)s,
+            %(has_available_offer)s,
             %(needs_review)s, %(review_reason)s
         )
         """
@@ -718,6 +728,14 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
     print(f"  merge_events:             {merge_events}")
     print(f"  repointed_offers:         {repointed_offers}")
     print(f"  unchanged_offers:         {unchanged_offers}")
+
+    # -- Availability summary --
+    # Count how many clusters have / lack at least one available offer.
+    # Printed in both dry-run and write mode for verification.
+    avail_true  = sum(1 for d in decisions if d["rep"]["has_available_offer"])
+    avail_false = sum(1 for d in decisions if not d["rep"]["has_available_offer"])
+    print(f"  has_available_offer=true: {avail_true}")
+    print(f"  has_available_offer=false:{avail_false}")
 
     _header("Merge aftermath")
     print(f"\n  repointed_subscriptions:  {repointed_subscriptions}")
