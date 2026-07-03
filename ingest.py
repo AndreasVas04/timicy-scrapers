@@ -12,6 +12,7 @@ Workflow:
 Usage:
   python ingest.py                    # ingest all six stores
   python ingest.py istorm public      # ingest only these two stores
+  python ingest.py --mark-disappeared # also mark unseen offers unavailable
 """
 
 import argparse
@@ -154,13 +155,16 @@ def build_copy_buffer(rows: list[dict]) -> io.StringIO:
     return buf
 
 
-def ingest_store(conn, store: str, category_map: dict[tuple[str, str], str]):
+def ingest_store(conn, store: str, category_map: dict[tuple[str, str], str],
+                 mark_disappeared: bool = False):
     """
     Ingest a single store's JSON file:
       1. Load JSON → COPY into a temp staging table.
       2. Map categories via category_map.
       3. Upsert into store_products, tracking new/updated/unchanged.
       4. Insert price_history rows only for new + changed offers.
+      5. Optionally mark store_products rows that did not appear in the
+         scrape as unavailable (--mark-disappeared).
     Everything runs inside a single transaction per store.
     """
     json_path = DATA_DIR / f"{store}.json"
@@ -226,6 +230,19 @@ def ingest_store(conn, store: str, category_map: dict[tuple[str, str], str]):
             with cur.copy("COPY _staging FROM STDIN") as copy:
                 for line in copy_buf:
                     copy.write(line)
+
+            # -- Snapshot the full scraped id set BEFORE the category filter --
+            # This temp table captures every store_product_id the scraper saw,
+            # including products whose (store, product_type) has no category
+            # mapping.  We must compare against this pre-filter set when marking
+            # disappeared offers; comparing against the post-filter _staging
+            # would falsely mark uncategorised-but-still-existing products as
+            # disappeared.  The table is ON COMMIT DROP so it lives only for
+            # this transaction.
+            cur.execute("""
+                CREATE TEMP TABLE _scraped_ids ON COMMIT DROP AS
+                SELECT store_product_id FROM _staging
+            """)
 
             # -- Add a category column to staging, filled from category_map --
             cur.execute("ALTER TABLE _staging ADD COLUMN category TEXT")
@@ -361,10 +378,55 @@ def ingest_store(conn, store: str, category_map: dict[tuple[str, str], str]):
             updated = cur.fetchone()[0]
             unchanged = conflict_count - updated
 
+            # -- Mark disappeared offers --
+            # When --mark-disappeared is active, any store_products row for
+            # this store that is currently available=true but whose
+            # store_product_id was NOT in the scraper output is marked
+            # unavailable.  This catches products the store has silently
+            # removed from its catalog, preventing stale prices from winning
+            # best-price comparisons.
+            #
+            # The "available = true" predicate makes this idempotent: a
+            # second run with the same data finds nothing left to mark.
+            # We do NOT touch last_scraped_at — these rows were genuinely
+            # not scraped, so the freshness badge must reflect that.
+            #
+            # A price_history row is inserted for each disappeared offer so
+            # that the availability transition is recorded, matching the
+            # convention used for regular price/availability changes.
+            disappeared_count = 0
+            if mark_disappeared:
+                cur.execute("""
+                    UPDATE store_products
+                    SET available = false,
+                        last_changed_at = NOW()
+                    WHERE store = %s::store_name
+                      AND available = true
+                      AND store_product_id NOT IN (
+                          SELECT store_product_id FROM _scraped_ids
+                      )
+                    RETURNING id, current_price
+                """, (store,))
+                disappeared_rows = cur.fetchall()
+                disappeared_count = len(disappeared_rows)
+
+                # Record price_history for each disappeared offer so the
+                # available=false transition appears in the price timeline.
+                if disappeared_rows:
+                    cur.executemany(
+                        """
+                        INSERT INTO price_history
+                            (store_product_id, price, available, recorded_at)
+                        VALUES (%s, %s, false, NOW())
+                        """,
+                        [(row[0], row[1]) for row in disappeared_rows],
+                    )
+
         # Print per-store summary
         print(f"  {store}: {total} read, {skipped_no_category} skipped (no category), "
               f"{inserted} inserted, {updated} updated, {unchanged} unchanged, "
-              f"{price_history_written} price_history rows")
+              f"{price_history_written} price_history rows, "
+              f"{disappeared_count} marked disappeared")
 
         # Report unmapped categories
         if unmapped_pairs:
@@ -392,6 +454,14 @@ def parse_args():
         default=list(VALID_STORES),
         help="Stores to ingest (default: all six).",
     )
+    parser.add_argument(
+        "--mark-disappeared",
+        action="store_true",
+        default=False,
+        help="After a successful scrape, mark store_products rows that did "
+             "not appear in the scrape as unavailable. Safe for nightly full "
+             "scrapes; omit for manual partial ingests.",
+    )
     return parser.parse_args()
 
 
@@ -412,13 +482,20 @@ def main():
             sys.exit(1)
 
     with psycopg.connect(db_url) as conn:
+        # Disable automatic prepared statements — they conflict with
+        # pgbouncer transaction-mode pooling (which Supabase uses by
+        # default), causing "DuplicatePreparedStatement" errors when a
+        # pooled server connection is reused.  Mirrors the existing guard
+        # in matching/writer.py and matching/load.py.
+        conn.prepare_threshold = None
+
         # Step A: load category mapping into DB and into a local lookup dict
         category_map = load_and_upsert_category_mapping(conn)
 
         # Step B: ingest each requested store
         print()
         for store in sorted(args.stores):
-            ingest_store(conn, store, category_map)
+            ingest_store(conn, store, category_map, args.mark_disappeared)
 
     print("\nDone.")
 
