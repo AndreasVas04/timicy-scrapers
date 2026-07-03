@@ -1,0 +1,53 @@
+# Nightly scrape → ingest → match → revalidate pipeline.
+#
+# All orchestration logic (parallel scrapers, per-store validation with
+# 50% row-count thresholds, failure isolation, exit codes) lives in
+# run_nightly.py so it is testable locally with --dry-run / --skip-scrape.
+# This workflow's only responsibilities are environment setup and secrets
+# injection.
+#
+# Alerting: GitHub emails the repo owner on workflow failure by default.
+# run_nightly.py exits 1 (partial success) or 2 (pipeline failure), both
+# of which mark the workflow run as failed — that IS the alerting contract.
+
+name: Nightly scrape
+
+on:
+  schedule:
+    # Minute 23 avoids GitHub's congested on-the-hour cron slots, which
+    # suffer from queuing delays and occasional skips under load.
+    - cron: "23 0 * * *"
+  # Allow supervised manual runs from the Actions tab.
+  workflow_dispatch: {}
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+
+    # Scrape is measured at ~3.5h (Stephanis-bound) + pipeline ~1 min.
+    # 330 min (5.5h) leaves margin while staying under the 6h hard limit.
+    timeout-minutes: 330
+
+    # A late-running job must never overlap with the next scheduled run.
+    # cancel-in-progress: false ensures the first run finishes rather than
+    # being killed by the newcomer — partial data is worse than late data.
+    concurrency:
+      group: nightly-scrape
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run pipeline
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          REVALIDATE_URL: ${{ secrets.REVALIDATE_URL }}
+          REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+        run: python run_nightly.py
