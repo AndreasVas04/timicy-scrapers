@@ -2,20 +2,24 @@
 # ci_probe.yml — THROWAWAY diagnostic workflow (safe to delete after use)
 #
 # Purpose:
-#   Measure, from a GitHub Actions runner (a datacenter IP), whether three
-#   stores that are known to block datacenter IPs will return HTTP 200 when
-#   we send a FULL browser header set WITHOUT any proxy.
+#   Test whether curl_cffi's browser TLS impersonation (chrome124 JA3
+#   fingerprint) can bypass the Cloudflare challenge on stephanis.com.cy
+#   WITHOUT any proxy, from a GitHub Actions datacenter IP.
+#
+#   Hypothesis: the cf-mitigated: challenge response seen from datacenter
+#   IPs is triggered by the TLS/JA3 fingerprint of standard HTTP clients
+#   (requests, urllib, plain curl), not purely by IP reputation.  If so,
+#   a client that presents a real-browser TLS fingerprint should get 200.
 #
 # What this workflow does NOT do:
 #   - does NOT run any scraper
 #   - does NOT touch the database
-#   - does NOT use any repository secret
+#   - does NOT use any repository secret or proxy
 #   - does NOT import or modify any existing repo code
 #
-# It is a read-only network probe: a handful of curl requests whose status
-# codes and "server:" response headers are printed to the job log.
+# It is a read-only network probe whose results are printed to the job log.
 # ---------------------------------------------------------------------------
-name: CI Probe (datacenter IP vs store blocking)
+name: CI Probe (curl_cffi TLS fingerprint vs Cloudflare)
 
 on:
   # Manual trigger only — never runs on push or on a schedule.
@@ -27,127 +31,133 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      # No checkout needed: this job uses only curl/bash, no repo code.
-      - name: Probe stores without proxy (full browser headers)
+      - name: Install curl_cffi
+        shell: bash
+        run: pip install curl_cffi --break-system-packages
+
+      - name: Probe stephanis with curl_cffi browser TLS impersonation
         shell: bash
         run: |
-          # GitHub Actions injects `-e -o pipefail` into every `run:` step by
-          # default, which aborted this job when a grep in a pipeline found no
-          # match. Explicitly disable both: a 403/blocked response or an empty
-          # grep result is exactly what we want to observe, so the job must
-          # never abort on non-200s or grep misses.
-          set +e +o pipefail
+          python3 << 'PYEOF'
+          import sys
 
-          # -------------------------------------------------------------
-          # Full browser header set, sent on EVERY request.
-          # The HTML "Accept" header is kept separate (ACCEPT_HTML) because
-          # the kotsovolos API probe overrides it with application/json.
-          # -------------------------------------------------------------
-          COMMON_HEADERS=(
-            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
-            -H 'Accept-Language: el-CY,el;q=0.9,en;q=0.8'
-            -H 'Accept-Encoding: gzip, deflate, br'
-            -H 'sec-ch-ua: "Chromium";v="125", "Not.A/Brand";v="24"'
-            -H 'sec-ch-ua-mobile: ?0'
-            -H 'sec-ch-ua-platform: "Windows"'
-            -H 'Sec-Fetch-Dest: document'
-            -H 'Sec-Fetch-Mode: navigate'
-            -H 'Sec-Fetch-Site: none'
-            -H 'Upgrade-Insecure-Requests: 1'
-          )
-          ACCEPT_HTML='Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-          ACCEPT_JSON='Accept: application/json'
+          # -- Show runner public IP so the log confirms this is a datacenter IP --
+          import subprocess
+          try:
+              ip = subprocess.run(
+                  ["curl", "-s", "--max-time", "15", "https://api.ipify.org"],
+                  capture_output=True, text=True, timeout=20
+              ).stdout.strip()
+              print(f"Runner public IP: {ip}")
+          except Exception as e:
+              print(f"Could not fetch public IP: {e}")
+              ip = "unknown"
+          print("NOTE: this is a GitHub Actions datacenter IP — no proxy is used.\n")
 
-          # -------------------------------------------------------------
-          # probe <label> <accept-header> <url>
-          #   Sends one GET with the full header set, discards the body,
-          #   dumps the response headers to the log, and prints:
-          #     - the "server:" response header (shows if Akamai is the blocker)
-          #     - the HTTP status code
-          #   Also records the status into RESULT_<label> for the summary.
-          # -------------------------------------------------------------
-          probe() {
-            local label="$1" accept="$2" url="$3"
-            echo ""
-            echo "=== ${label} (no proxy, full headers) ==="
-            echo "URL: ${url}"
-            # -s silent, -o /dev/null discard body, -D - dump resp headers
-            # to stdout, -w prints the status code on its own line at the end.
-            local out
-            out=$(curl -s --compressed --max-time 30 -o /dev/null -D - \
-                    -w '\nHTTP %{http_code}\n' \
-                    "${COMMON_HEADERS[@]}" -H "${accept}" \
-                    "${url}") || echo "WARN: curl failed (network error/timeout) for ${label}"
-            echo "${out}"
-            # Extract the "server:" header (case-insensitive), if any.
-            echo "${out}" | grep -i '^server:' || echo "(no server header returned)"
-            # Extract the status code from the -w line for the final summary.
-            local code
-            code=$(echo "${out}" | grep -oP '^HTTP \K[0-9]+' | tail -n1)
-            eval "RESULT_${label}=\${code:-ERR}"
+          from curl_cffi import requests as cffi_requests
+
+          TARGET = "https://www.stephanis.com.cy/sitemap.xml"
+
+          # Full browser header set — same headers the previous bash probe used.
+          BROWSER_HEADERS = {
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+              "Accept-Language": "el-CY,el;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate, br",
+              "sec-ch-ua": '"Chromium";v="124", "Not.A/Brand";v="24"',
+              "sec-ch-ua-mobile": "?0",
+              "sec-ch-ua-platform": '"Windows"',
+              "Sec-Fetch-Dest": "document",
+              "Sec-Fetch-Mode": "navigate",
+              "Sec-Fetch-Site": "none",
+              "Upgrade-Insecure-Requests": "1",
           }
 
-          # -------------------------------------------------------------
-          # Self-documenting preamble: show the runner's public IP so the
-          # log makes clear these probes came from a datacenter address.
-          # -------------------------------------------------------------
-          echo "Runner public IP: $(curl -s --max-time 30 https://api.ipify.org)"
-          echo "NOTE: this is a GitHub Actions datacenter IP — probing whether stores block it even with full browser headers."
 
-          # -------------------------------------------------------------
-          # Step A — extract a real kotsovolos category id at runtime.
-          # The AEM content host (new-content.kotsovolos.cy) is NOT blocked,
-          # so we fetch the nav menu JSON and grab the first numeric
-          # "uniqueID" value. No hardcoded category ids.
-          # -------------------------------------------------------------
-          echo ""
-          echo "=== Step A: extract kotsovolos category id from nav menu JSON ==="
-          # Fetch the nav menu to a file and print the HTTP status plus the
-          # first 200 bytes of the body, so the log shows exactly what the
-          # AEM host returned from this datacenter IP (empty body vs 403 vs
-          # schema change) — instead of a silent grep miss.
-          AEM_STATUS=$(curl -s --compressed --max-time 30 \
-                         -w '\nAEM_HTTP %{http_code}\n' \
-                         -o /tmp/navmenu.json \
-                         "${COMMON_HEADERS[@]}" -H "${ACCEPT_JSON}" \
-                         'https://new-content.kotsovolos.cy/content/kotsovolos/b2c/cy/home.navMenu.json')
-          echo "${AEM_STATUS}"
-          echo "--- first 200 bytes of nav menu response body ---"
-          head -c 200 /tmp/navmenu.json
-          echo ""
-          echo "--- end of body preview ---"
-          # Extract the first numeric "uniqueID" from the saved file.
-          # -oE (not -oP \K) matches the diagnostic that already worked, and
-          # `|| true` guarantees a miss cannot abort the job.
-          CATID=$(grep -oE '"uniqueID"[[:space:]]*:[[:space:]]*"?[0-9]+' /tmp/navmenu.json | grep -oE '[0-9]+' | head -n1 || true)
-          if [ -n "${CATID}" ]; then
-            echo "Extracted CATID=${CATID}"
-          else
-            echo "WARN: could not extract a uniqueID from the nav menu JSON — kotsovolos API probe will be skipped."
-          fi
+          def classify(status_code, headers, body_preview):
+              """Return a one-line verdict string."""
+              cf_mitigated = headers.get("cf-mitigated", "")
+              if status_code == 200 and body_preview.lstrip().startswith("<?xml"):
+                  return "PASS: bypassed without proxy"
+              if cf_mitigated:
+                  return f"STILL CHALLENGED (cf-mitigated: {cf_mitigated})"
+              if "challenges.cloudflare.com" in body_preview or "Just a moment" in body_preview:
+                  return "STILL CHALLENGED (challenge HTML in body)"
+              return f"UNCLEAR — status {status_code}, inspect body preview above"
 
-          # -------------------------------------------------------------
-          # Step B — probe the three targets (no proxy).
-          # -------------------------------------------------------------
-          probe stephanis "${ACCEPT_HTML}" 'https://www.stephanis.com.cy/sitemap.xml'
-          probe public    "${ACCEPT_HTML}" 'https://www.public.cy/sitemap.xml'
 
-          if [ -n "${CATID}" ]; then
-            # kotsovolos API: GET with url-encoded query params and a JSON
-            # Accept header (overriding the HTML Accept used above).
-            # params=pageNumber=1&pageSize=100 url-encodes to
-            # pageNumber%3D1%26pageSize%3D100.
-            probe kotsovolos "${ACCEPT_JSON}" \
-              "https://www.kotsovolos.cy/api/ext/getProductsByCategory?catId=${CATID}&storeId=10161&params=pageNumber%3D1%26pageSize%3D100"
-          else
-            RESULT_kotsovolos="SKIPPED (no CATID)"
-          fi
+          def run_probe(label, url, extra_headers=None):
+              """Send a GET via curl_cffi with chrome TLS impersonation."""
+              print(f"\n{'='*60}")
+              print(f"=== {label} ===")
+              print(f"URL: {url}")
+              print(f"Impersonation: chrome124 (browser TLS fingerprint)")
+              if extra_headers:
+                  print(f"Extra headers: YES (full browser header set)")
+              else:
+                  print(f"Extra headers: NO (only curl_cffi defaults)")
+              print(f"Proxy: NONE")
+              print(f"{'='*60}")
 
-          # -------------------------------------------------------------
-          # Final summary — one explicit line per store, easy to grep.
-          # -------------------------------------------------------------
-          echo ""
-          echo "=== SUMMARY ==="
-          echo "RESULT stephanis: ${RESULT_stephanis:-ERR}"
-          echo "RESULT public: ${RESULT_public:-ERR}"
-          echo "RESULT kotsovolos: ${RESULT_kotsovolos:-ERR}"
+              try:
+                  resp = cffi_requests.get(
+                      url,
+                      impersonate="chrome124",
+                      headers=extra_headers or {},
+                      timeout=30,
+                  )
+              except Exception as e:
+                  print(f"REQUEST FAILED: {type(e).__name__}: {e}")
+                  return "ERR", str(e)
+
+              status = resp.status_code
+              hdrs = dict(resp.headers)
+
+              print(f"\nHTTP status: {status}")
+
+              # Print key response headers.
+              for hdr_name in ("server", "cf-mitigated", "cf-ray", "content-type"):
+                  val = hdrs.get(hdr_name, "(not present)")
+                  print(f"  {hdr_name}: {val}")
+
+              # Body preview — first 300 chars.
+              body = resp.text[:300] if resp.text else "(empty body)"
+              print(f"\nBody preview (first 300 chars):\n{body}")
+
+              verdict = classify(status, hdrs, resp.text or "")
+              print(f"\nVerdict: {verdict}")
+
+              return status, verdict
+
+
+          # ---------------------------------------------------------------
+          # Probe 1 — curl_cffi with chrome124 TLS impersonation, NO extra
+          #           headers (only the defaults curl_cffi sets internally).
+          # ---------------------------------------------------------------
+          status1, verdict1 = run_probe(
+              "Probe 1: curl_cffi chrome124 — TLS only, no custom headers",
+              TARGET,
+              extra_headers=None,
+          )
+
+          # ---------------------------------------------------------------
+          # Probe 2 — curl_cffi with chrome124 TLS impersonation PLUS the
+          #           full browser header set (Accept, sec-ch-ua, etc.).
+          #           Tests whether headers + TLS together matter.
+          # ---------------------------------------------------------------
+          status2, verdict2 = run_probe(
+              "Probe 2: curl_cffi chrome124 — TLS + full browser headers",
+              TARGET,
+              extra_headers=BROWSER_HEADERS,
+          )
+
+          # ---------------------------------------------------------------
+          # Final summary — easy to grep from the job log.
+          # ---------------------------------------------------------------
+          print("\n" + "="*60)
+          print("=== SUMMARY ===")
+          print(f"RESULT stephanis curl_cffi no-proxy: {status1}")
+          print(f"RESULT stephanis curl_cffi + headers: {status2}")
+          print(f"  Verdict (TLS only):          {verdict1}")
+          print(f"  Verdict (TLS + headers):     {verdict2}")
+          print("="*60)
+          PYEOF
