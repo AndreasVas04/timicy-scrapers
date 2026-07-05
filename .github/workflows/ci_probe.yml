@@ -74,7 +74,7 @@ jobs:
             # -s silent, -o /dev/null discard body, -D - dump resp headers
             # to stdout, -w prints the status code on its own line at the end.
             local out
-            out=$(curl -s --max-time 30 -o /dev/null -D - \
+            out=$(curl -s --compressed --max-time 30 -o /dev/null -D - \
                     -w '\nHTTP %{http_code}\n' \
                     "${COMMON_HEADERS[@]}" -H "${accept}" \
                     "${url}") || echo "WARN: curl failed (network error/timeout) for ${label}"
@@ -106,7 +106,7 @@ jobs:
           # first 200 bytes of the body, so the log shows exactly what the
           # AEM host returned from this datacenter IP (empty body vs 403 vs
           # schema change) — instead of a silent grep miss.
-          AEM_STATUS=$(curl -s --max-time 30 \
+          AEM_STATUS=$(curl -s --compressed --max-time 30 \
                          -w '\nAEM_HTTP %{http_code}\n' \
                          -o /tmp/navmenu.json \
                          "${COMMON_HEADERS[@]}" -H "${ACCEPT_JSON}" \
