@@ -31,8 +31,12 @@ jobs:
       - name: Probe stores without proxy (full browser headers)
         shell: bash
         run: |
-          # NOTE: no `set -e` on purpose — a 403/blocked response is exactly
-          # what we want to observe, so the job must not abort on non-200s.
+          # GitHub Actions injects `-e -o pipefail` into every `run:` step by
+          # default, which aborted this job when a grep in a pipeline found no
+          # match. Explicitly disable both: a 403/blocked response or an empty
+          # grep result is exactly what we want to observe, so the job must
+          # never abort on non-200s or grep misses.
+          set +e +o pipefail
 
           # -------------------------------------------------------------
           # Full browser header set, sent on EVERY request.
@@ -98,10 +102,24 @@ jobs:
           # -------------------------------------------------------------
           echo ""
           echo "=== Step A: extract kotsovolos category id from nav menu JSON ==="
-          CATID=$(curl -s --max-time 30 \
-                    "${COMMON_HEADERS[@]}" -H "${ACCEPT_JSON}" \
-                    'https://new-content.kotsovolos.cy/content/kotsovolos/b2c/cy/home.navMenu.json' \
-                  | grep -oP '"uniqueID"\s*:\s*"?\K[0-9]+' | head -n1)
+          # Fetch the nav menu to a file and print the HTTP status plus the
+          # first 200 bytes of the body, so the log shows exactly what the
+          # AEM host returned from this datacenter IP (empty body vs 403 vs
+          # schema change) — instead of a silent grep miss.
+          AEM_STATUS=$(curl -s --max-time 30 \
+                         -w '\nAEM_HTTP %{http_code}\n' \
+                         -o /tmp/navmenu.json \
+                         "${COMMON_HEADERS[@]}" -H "${ACCEPT_JSON}" \
+                         'https://new-content.kotsovolos.cy/content/kotsovolos/b2c/cy/home.navMenu.json')
+          echo "${AEM_STATUS}"
+          echo "--- first 200 bytes of nav menu response body ---"
+          head -c 200 /tmp/navmenu.json
+          echo ""
+          echo "--- end of body preview ---"
+          # Extract the first numeric "uniqueID" from the saved file.
+          # -oE (not -oP \K) matches the diagnostic that already worked, and
+          # `|| true` guarantees a miss cannot abort the job.
+          CATID=$(grep -oE '"uniqueID"[[:space:]]*:[[:space:]]*"?[0-9]+' /tmp/navmenu.json | grep -oE '[0-9]+' | head -n1 || true)
           if [ -n "${CATID}" ]; then
             echo "Extracted CATID=${CATID}"
           else
