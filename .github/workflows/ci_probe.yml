@@ -1,0 +1,135 @@
+# ---------------------------------------------------------------------------
+# ci_probe.yml — THROWAWAY diagnostic workflow (safe to delete after use)
+#
+# Purpose:
+#   Measure, from a GitHub Actions runner (a datacenter IP), whether three
+#   stores that are known to block datacenter IPs will return HTTP 200 when
+#   we send a FULL browser header set WITHOUT any proxy.
+#
+# What this workflow does NOT do:
+#   - does NOT run any scraper
+#   - does NOT touch the database
+#   - does NOT use any repository secret
+#   - does NOT import or modify any existing repo code
+#
+# It is a read-only network probe: a handful of curl requests whose status
+# codes and "server:" response headers are printed to the job log.
+# ---------------------------------------------------------------------------
+name: CI Probe (datacenter IP vs store blocking)
+
+on:
+  # Manual trigger only — never runs on push or on a schedule.
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # No checkout needed: this job uses only curl/bash, no repo code.
+      - name: Probe stores without proxy (full browser headers)
+        shell: bash
+        run: |
+          # NOTE: no `set -e` on purpose — a 403/blocked response is exactly
+          # what we want to observe, so the job must not abort on non-200s.
+
+          # -------------------------------------------------------------
+          # Full browser header set, sent on EVERY request.
+          # The HTML "Accept" header is kept separate (ACCEPT_HTML) because
+          # the kotsovolos API probe overrides it with application/json.
+          # -------------------------------------------------------------
+          COMMON_HEADERS=(
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+            -H 'Accept-Language: el-CY,el;q=0.9,en;q=0.8'
+            -H 'Accept-Encoding: gzip, deflate, br'
+            -H 'sec-ch-ua: "Chromium";v="125", "Not.A/Brand";v="24"'
+            -H 'sec-ch-ua-mobile: ?0'
+            -H 'sec-ch-ua-platform: "Windows"'
+            -H 'Sec-Fetch-Dest: document'
+            -H 'Sec-Fetch-Mode: navigate'
+            -H 'Sec-Fetch-Site: none'
+            -H 'Upgrade-Insecure-Requests: 1'
+          )
+          ACCEPT_HTML='Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+          ACCEPT_JSON='Accept: application/json'
+
+          # -------------------------------------------------------------
+          # probe <label> <accept-header> <url>
+          #   Sends one GET with the full header set, discards the body,
+          #   dumps the response headers to the log, and prints:
+          #     - the "server:" response header (shows if Akamai is the blocker)
+          #     - the HTTP status code
+          #   Also records the status into RESULT_<label> for the summary.
+          # -------------------------------------------------------------
+          probe() {
+            local label="$1" accept="$2" url="$3"
+            echo ""
+            echo "=== ${label} (no proxy, full headers) ==="
+            echo "URL: ${url}"
+            # -s silent, -o /dev/null discard body, -D - dump resp headers
+            # to stdout, -w prints the status code on its own line at the end.
+            local out
+            out=$(curl -s --max-time 30 -o /dev/null -D - \
+                    -w '\nHTTP %{http_code}\n' \
+                    "${COMMON_HEADERS[@]}" -H "${accept}" \
+                    "${url}") || echo "WARN: curl failed (network error/timeout) for ${label}"
+            echo "${out}"
+            # Extract the "server:" header (case-insensitive), if any.
+            echo "${out}" | grep -i '^server:' || echo "(no server header returned)"
+            # Extract the status code from the -w line for the final summary.
+            local code
+            code=$(echo "${out}" | grep -oP '^HTTP \K[0-9]+' | tail -n1)
+            eval "RESULT_${label}=\${code:-ERR}"
+          }
+
+          # -------------------------------------------------------------
+          # Self-documenting preamble: show the runner's public IP so the
+          # log makes clear these probes came from a datacenter address.
+          # -------------------------------------------------------------
+          echo "Runner public IP: $(curl -s --max-time 30 https://api.ipify.org)"
+          echo "NOTE: this is a GitHub Actions datacenter IP — probing whether stores block it even with full browser headers."
+
+          # -------------------------------------------------------------
+          # Step A — extract a real kotsovolos category id at runtime.
+          # The AEM content host (new-content.kotsovolos.cy) is NOT blocked,
+          # so we fetch the nav menu JSON and grab the first numeric
+          # "uniqueID" value. No hardcoded category ids.
+          # -------------------------------------------------------------
+          echo ""
+          echo "=== Step A: extract kotsovolos category id from nav menu JSON ==="
+          CATID=$(curl -s --max-time 30 \
+                    "${COMMON_HEADERS[@]}" -H "${ACCEPT_JSON}" \
+                    'https://new-content.kotsovolos.cy/content/kotsovolos/b2c/cy/home.navMenu.json' \
+                  | grep -oP '"uniqueID"\s*:\s*"?\K[0-9]+' | head -n1)
+          if [ -n "${CATID}" ]; then
+            echo "Extracted CATID=${CATID}"
+          else
+            echo "WARN: could not extract a uniqueID from the nav menu JSON — kotsovolos API probe will be skipped."
+          fi
+
+          # -------------------------------------------------------------
+          # Step B — probe the three targets (no proxy).
+          # -------------------------------------------------------------
+          probe stephanis "${ACCEPT_HTML}" 'https://www.stephanis.com.cy/sitemap.xml'
+          probe public    "${ACCEPT_HTML}" 'https://www.public.cy/sitemap.xml'
+
+          if [ -n "${CATID}" ]; then
+            # kotsovolos API: GET with url-encoded query params and a JSON
+            # Accept header (overriding the HTML Accept used above).
+            # params=pageNumber=1&pageSize=100 url-encodes to
+            # pageNumber%3D1%26pageSize%3D100.
+            probe kotsovolos "${ACCEPT_JSON}" \
+              "https://www.kotsovolos.cy/api/ext/getProductsByCategory?catId=${CATID}&storeId=10161&params=pageNumber%3D1%26pageSize%3D100"
+          else
+            RESULT_kotsovolos="SKIPPED (no CATID)"
+          fi
+
+          # -------------------------------------------------------------
+          # Final summary — one explicit line per store, easy to grep.
+          # -------------------------------------------------------------
+          echo ""
+          echo "=== SUMMARY ==="
+          echo "RESULT stephanis: ${RESULT_stephanis:-ERR}"
+          echo "RESULT public: ${RESULT_public:-ERR}"
+          echo "RESULT kotsovolos: ${RESULT_kotsovolos:-ERR}"
