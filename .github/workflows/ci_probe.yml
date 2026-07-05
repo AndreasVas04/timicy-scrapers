@@ -2,14 +2,13 @@
 # ci_probe.yml — THROWAWAY diagnostic workflow (safe to delete after use)
 #
 # Purpose:
-#   Test whether curl_cffi's browser TLS impersonation (chrome124 JA3
-#   fingerprint) can bypass the Cloudflare challenge on stephanis.com.cy
-#   WITHOUT any proxy, from a GitHub Actions datacenter IP.
+#   Probe whether non-www hosts / subdomains of stephanis.com.cy bypass
+#   Cloudflare.  Many small sites only protect www — if the apex domain
+#   or a subdomain (api, assets, cdn) serves the same content without a
+#   CF challenge, the scraper can hit it directly from the datacenter IP.
 #
-#   Hypothesis: the cf-mitigated: challenge response seen from datacenter
-#   IPs is triggered by the TLS/JA3 fingerprint of standard HTTP clients
-#   (requests, urllib, plain curl), not purely by IP reputation.  If so,
-#   a client that presents a real-browser TLS fingerprint should get 200.
+# Also checks DNS resolution (Cloudflare IPs vs origin) and queries the
+# Wayback Machine availability API for an archived sitemap snapshot.
 #
 # What this workflow does NOT do:
 #   - does NOT run any scraper
@@ -19,7 +18,7 @@
 #
 # It is a read-only network probe whose results are printed to the job log.
 # ---------------------------------------------------------------------------
-name: CI Probe (curl_cffi TLS fingerprint vs Cloudflare)
+name: CI Probe (stephanis host/subdomain Cloudflare bypass)
 
 on:
   # Manual trigger only — never runs on push or on a schedule.
@@ -31,133 +30,208 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Install curl_cffi
-        shell: bash
-        run: pip install curl_cffi --break-system-packages
-
-      - name: Probe stephanis with curl_cffi browser TLS impersonation
+      - name: Probe stephanis hosts and subdomains
         shell: bash
         run: |
-          python3 << 'PYEOF'
-          import sys
+          set +e +o pipefail
 
-          # -- Show runner public IP so the log confirms this is a datacenter IP --
-          import subprocess
-          try:
-              ip = subprocess.run(
-                  ["curl", "-s", "--max-time", "15", "https://api.ipify.org"],
-                  capture_output=True, text=True, timeout=20
-              ).stdout.strip()
-              print(f"Runner public IP: {ip}")
-          except Exception as e:
-              print(f"Could not fetch public IP: {e}")
-              ip = "unknown"
-          print("NOTE: this is a GitHub Actions datacenter IP — no proxy is used.\n")
+          # --- Common browser headers used on every request ---
+          BROWSER_HEADERS=(
+            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+            -H 'Accept-Language: el-CY,el;q=0.9,en;q=0.8'
+            -H 'Accept-Encoding: gzip, deflate, br'
+            -H 'sec-ch-ua: "Chromium";v="124", "Not.A/Brand";v="24"'
+            -H 'sec-ch-ua-mobile: ?0'
+            -H 'sec-ch-ua-platform: "Windows"'
+            -H 'Sec-Fetch-Dest: document'
+            -H 'Sec-Fetch-Mode: navigate'
+            -H 'Sec-Fetch-Site: none'
+            -H 'Upgrade-Insecure-Requests: 1'
+          )
 
-          from curl_cffi import requests as cffi_requests
+          # --- Show the runner's public IP (confirms datacenter, no proxy) ---
+          echo "============================================================"
+          echo "=== Runner Public IP ==="
+          echo "============================================================"
+          RUNNER_IP=$(curl -s --max-time 10 https://api.ipify.org || echo "unknown")
+          echo "Public IP: $RUNNER_IP"
+          echo "(GitHub Actions datacenter IP — no proxy is used)"
+          echo ""
 
-          TARGET = "https://www.stephanis.com.cy/sitemap.xml"
+          # =================================================================
+          # SECTION 1 — DNS resolution check
+          #   Cloudflare proxied domains resolve to 104.x / 172.x ranges.
+          #   An origin IP (e.g. a hosting provider) means no CF proxy.
+          # =================================================================
+          echo "============================================================"
+          echo "=== DNS Resolution ==="
+          echo "============================================================"
+          echo ""
+          echo "--- dig +short stephanis.com.cy (apex) ---"
+          dig +short stephanis.com.cy || echo "(dig failed)"
+          echo ""
+          echo "--- dig +short www.stephanis.com.cy ---"
+          dig +short www.stephanis.com.cy || echo "(dig failed)"
+          echo ""
 
-          # Full browser header set — same headers the previous bash probe used.
-          BROWSER_HEADERS = {
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-              "Accept-Language": "el-CY,el;q=0.9,en;q=0.8",
-              "Accept-Encoding": "gzip, deflate, br",
-              "sec-ch-ua": '"Chromium";v="124", "Not.A/Brand";v="24"',
-              "sec-ch-ua-mobile": "?0",
-              "sec-ch-ua-platform": '"Windows"',
-              "Sec-Fetch-Dest": "document",
-              "Sec-Fetch-Mode": "navigate",
-              "Sec-Fetch-Site": "none",
-              "Upgrade-Insecure-Requests": "1",
+          # =================================================================
+          # SECTION 2 — Main URL probes (full browser headers, GET)
+          #   For each URL: print status, server header, cf-mitigated header,
+          #   first 200 chars of body, and a verdict line.
+          # =================================================================
+
+          probe_url() {
+            # $1 = label, $2 = URL
+            local LABEL="$1"
+            local URL="$2"
+
+            echo "============================================================"
+            echo "=== $LABEL ==="
+            echo "URL: $URL"
+            echo "============================================================"
+
+            # Fetch into a temp file so we can inspect headers + body separately.
+            local TMPFILE
+            TMPFILE=$(mktemp)
+
+            local HTTP_CODE
+            HTTP_CODE=$(curl -s -o "$TMPFILE" -D - \
+              --max-time 20 --compressed \
+              "${BROWSER_HEADERS[@]}" \
+              -w '\n%{http_code}' \
+              "$URL" 2>/dev/null)
+
+            # The last line of output is the HTTP status code (-w format).
+            # Everything before it is the response headers + body in $TMPFILE.
+            # curl -D - writes headers to stdout; -o writes body to file.
+            # We re-do this more cleanly: headers to one file, body to another.
+            rm -f "$TMPFILE"
+
+            local HDR_FILE BODY_FILE
+            HDR_FILE=$(mktemp)
+            BODY_FILE=$(mktemp)
+
+            HTTP_CODE=$(curl -s -D "$HDR_FILE" -o "$BODY_FILE" \
+              --max-time 20 --compressed \
+              "${BROWSER_HEADERS[@]}" \
+              -w '%{http_code}' \
+              "$URL" 2>/dev/null)
+
+            echo "HTTP status:   $HTTP_CODE"
+
+            # Extract key headers.
+            local SERVER CF_MITIGATED
+            SERVER=$(grep -i '^server:' "$HDR_FILE" | head -1 | sed 's/^[^:]*: //' | tr -d '\r')
+            CF_MITIGATED=$(grep -i '^cf-mitigated:' "$HDR_FILE" | head -1 | sed 's/^[^:]*: //' | tr -d '\r')
+
+            echo "server:        ${SERVER:-(not present)}"
+            echo "cf-mitigated:  ${CF_MITIGATED:-(not present)}"
+
+            # Body preview — first 200 chars.
+            local BODY_PREVIEW
+            BODY_PREVIEW=$(head -c 200 "$BODY_FILE" 2>/dev/null)
+            echo ""
+            echo "Body (first 200 chars):"
+            echo "$BODY_PREVIEW"
+            echo ""
+
+            # --- Verdict ---
+            local BODY_FULL
+            BODY_FULL=$(cat "$BODY_FILE" 2>/dev/null)
+
+            if [[ -n "$CF_MITIGATED" ]]; then
+              echo ">>> VERDICT: CLOUDFLARE CHALLENGE (cf-mitigated header present)"
+            elif echo "$BODY_FULL" | grep -q "Just a moment"; then
+              echo ">>> VERDICT: CLOUDFLARE CHALLENGE (body contains 'Just a moment')"
+            elif [[ "$HTTP_CODE" == "200" ]]; then
+              echo ">>> VERDICT: CLEAN (no Cloudflare block)"
+            else
+              echo ">>> VERDICT: UNCLEAR — status $HTTP_CODE, inspect body above"
+            fi
+
+            echo ""
+            rm -f "$HDR_FILE" "$BODY_FILE"
           }
 
+          # Probe 1 — www sitemap (known-blocked baseline)
+          probe_url "Probe 1: www sitemap (known-blocked baseline)" \
+            "https://www.stephanis.com.cy/sitemap.xml"
 
-          def classify(status_code, headers, body_preview):
-              """Return a one-line verdict string."""
-              cf_mitigated = headers.get("cf-mitigated", "")
-              if status_code == 200 and body_preview.lstrip().startswith("<?xml"):
-                  return "PASS: bypassed without proxy"
-              if cf_mitigated:
-                  return f"STILL CHALLENGED (cf-mitigated: {cf_mitigated})"
-              if "challenges.cloudflare.com" in body_preview or "Just a moment" in body_preview:
-                  return "STILL CHALLENGED (challenge HTML in body)"
-              return f"UNCLEAR — status {status_code}, inspect body preview above"
+          # Probe 2 — apex domain sitemap (no www)
+          probe_url "Probe 2: apex domain sitemap (no www)" \
+            "https://stephanis.com.cy/sitemap.xml"
 
+          # Probe 3 — www product page (real product from data dump)
+          probe_url "Probe 3: www product page" \
+            "https://www.stephanis.com.cy/en/products/410161"
 
-          def run_probe(label, url, extra_headers=None):
-              """Send a GET via curl_cffi with chrome TLS impersonation."""
-              print(f"\n{'='*60}")
-              print(f"=== {label} ===")
-              print(f"URL: {url}")
-              print(f"Impersonation: chrome124 (browser TLS fingerprint)")
-              if extra_headers:
-                  print(f"Extra headers: YES (full browser header set)")
-              else:
-                  print(f"Extra headers: NO (only curl_cffi defaults)")
-              print(f"Proxy: NONE")
-              print(f"{'='*60}")
+          # Probe 4 — apex product page (same product, no www)
+          probe_url "Probe 4: apex product page (no www)" \
+            "https://stephanis.com.cy/en/products/410161"
 
-              try:
-                  resp = cffi_requests.get(
-                      url,
-                      impersonate="chrome124",
-                      headers=extra_headers or {},
-                      timeout=30,
-                  )
-              except Exception as e:
-                  print(f"REQUEST FAILED: {type(e).__name__}: {e}")
-                  return "ERR", str(e)
+          # =================================================================
+          # SECTION 3 — Subdomain probes (api, assets, cdn)
+          #   These may not exist — wrap each so DNS failure prints a clean
+          #   line instead of aborting.
+          # =================================================================
+          echo "============================================================"
+          echo "=== Subdomain probes (api / assets / cdn) ==="
+          echo "============================================================"
+          echo ""
 
-              status = resp.status_code
-              hdrs = dict(resp.headers)
+          probe_subdomain() {
+            # $1 = URL
+            local URL="$1"
+            local HOST
+            HOST=$(echo "$URL" | sed 's|https://||' | cut -d/ -f1)
 
-              print(f"\nHTTP status: {status}")
+            # Check if the host resolves at all.
+            if ! dig +short "$HOST" 2>/dev/null | grep -q .; then
+              echo "$URL — (no such host)"
+              return
+            fi
 
-              # Print key response headers.
-              for hdr_name in ("server", "cf-mitigated", "cf-ray", "content-type"):
-                  val = hdrs.get(hdr_name, "(not present)")
-                  print(f"  {hdr_name}: {val}")
+            local HDR_FILE BODY_FILE HTTP_CODE
+            HDR_FILE=$(mktemp)
+            BODY_FILE=$(mktemp)
 
-              # Body preview — first 300 chars.
-              body = resp.text[:300] if resp.text else "(empty body)"
-              print(f"\nBody preview (first 300 chars):\n{body}")
+            HTTP_CODE=$(curl -s -D "$HDR_FILE" -o "$BODY_FILE" \
+              --max-time 10 --compressed \
+              "${BROWSER_HEADERS[@]}" \
+              -w '%{http_code}' \
+              "$URL" 2>/dev/null)
 
-              verdict = classify(status, hdrs, resp.text or "")
-              print(f"\nVerdict: {verdict}")
+            local SERVER
+            SERVER=$(grep -i '^server:' "$HDR_FILE" | head -1 | sed 's/^[^:]*: //' | tr -d '\r')
 
-              return status, verdict
+            echo "$URL — status: $HTTP_CODE, server: ${SERVER:-(none)} (resolves)"
+            rm -f "$HDR_FILE" "$BODY_FILE"
+          }
 
+          probe_subdomain "https://api.stephanis.com.cy"
+          probe_subdomain "https://assets.stephanis.com.cy"
+          probe_subdomain "https://cdn.stephanis.com.cy"
+          echo ""
 
-          # ---------------------------------------------------------------
-          # Probe 1 — curl_cffi with chrome124 TLS impersonation, NO extra
-          #           headers (only the defaults curl_cffi sets internally).
-          # ---------------------------------------------------------------
-          status1, verdict1 = run_probe(
-              "Probe 1: curl_cffi chrome124 — TLS only, no custom headers",
-              TARGET,
-              extra_headers=None,
-          )
+          # =================================================================
+          # SECTION 4 — Wayback Machine availability API
+          #   archive.org is never Cloudflare-blocked. If a recent snapshot
+          #   of the sitemap exists, we can parse it for product URLs without
+          #   ever hitting stephanis directly.
+          # =================================================================
+          echo "============================================================"
+          echo "=== Wayback Machine availability API ==="
+          echo "============================================================"
+          echo ""
+          echo "Checking if an archived snapshot of the sitemap exists..."
+          echo ""
+          WAYBACK_JSON=$(curl -s --max-time 20 \
+            "https://archive.org/wayback/available?url=www.stephanis.com.cy/sitemap.xml")
+          echo "Raw JSON response:"
+          echo "$WAYBACK_JSON"
+          echo ""
 
-          # ---------------------------------------------------------------
-          # Probe 2 — curl_cffi with chrome124 TLS impersonation PLUS the
-          #           full browser header set (Accept, sec-ch-ua, etc.).
-          #           Tests whether headers + TLS together matter.
-          # ---------------------------------------------------------------
-          status2, verdict2 = run_probe(
-              "Probe 2: curl_cffi chrome124 — TLS + full browser headers",
-              TARGET,
-              extra_headers=BROWSER_HEADERS,
-          )
-
-          # ---------------------------------------------------------------
-          # Final summary — easy to grep from the job log.
-          # ---------------------------------------------------------------
-          print("\n" + "="*60)
-          print("=== SUMMARY ===")
-          print(f"RESULT stephanis curl_cffi no-proxy: {status1}")
-          print(f"RESULT stephanis curl_cffi + headers: {status2}")
-          print(f"  Verdict (TLS only):          {verdict1}")
-          print(f"  Verdict (TLS + headers):     {verdict2}")
-          print("="*60)
-          PYEOF
+          echo "============================================================"
+          echo "=== DONE ==="
+          echo "============================================================"
