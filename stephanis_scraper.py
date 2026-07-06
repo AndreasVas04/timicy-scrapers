@@ -174,7 +174,7 @@ def extract_mpn_root(mpn: str | None) -> str | None:
 
 # ── Sitemap parsing ────────────────────────────────────────────
 
-def fetch_product_urls() -> list[str]:
+def fetch_product_urls(proxy_url: str | None = None) -> list[str]:
     """Parse the XML sitemap index and collect all English product page URLs.
 
     The sitemap at /sitemap.xml is a sitemap index pointing to multiple
@@ -184,17 +184,76 @@ def fetch_product_urls() -> list[str]:
     We filter to only English product URLs (/en/products/{id}) since
     the Greek pages (/el/products/{id}) contain the same products
     with translated titles — scraping both would create duplicates.
+
+    Args:
+        proxy_url: Optional proxy URL to route requests through.  The
+            sitemap lives on the same Cloudflare-protected host as the
+            product pages, so in CI the request must go through a
+            residential proxy IP.  Pass None for a direct connection
+            (local development).  httpx treats proxy=None as direct.
+            NEVER log this value — it contains credentials.
+
+    Retries up to 3 times on transient errors (timeout, connection
+    failure, HTTP 429/5xx) with exponential backoff (1s, 2s, 4s).
+    A 403 raises immediately — it means the WAF blocked us and
+    retrying won't help.
     """
     log.info("Fetching sitemap index: %s", SITEMAP_INDEX_URL)
+    # Log the connection mode (proxy vs direct) without revealing the URL.
+    log.info("Sitemap discovery %s.", "via proxy" if proxy_url else "direct")
 
+    def _get_with_retry(client: httpx.Client, url: str) -> httpx.Response:
+        """Fetch a URL with retry + exponential backoff on transient errors.
+
+        Retries on httpx.TimeoutException, httpx.ConnectError, and HTTP
+        429/5xx responses.  HTTP 403 raises immediately — it signals a
+        Cloudflare WAF block that won't clear on retry.  All other
+        non-200 statuses also raise immediately via raise_for_status().
+        """
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                resp = client.get(url)
+                # 403 = Cloudflare WAF block — retrying won't help.
+                if resp.status_code == 403:
+                    resp.raise_for_status()
+                # Retryable server-side errors (429 rate-limit, 5xx).
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    log.warning(
+                        "HTTP %s fetching %s (attempt %d/%d), retrying in %ds…",
+                        resp.status_code, url, attempt + 1, max_attempts, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                # Any other non-200 — raise immediately.
+                resp.raise_for_status()
+                return resp
+            except (httpx.TimeoutException, httpx.ConnectError) as e:
+                # Transient network errors — retry with backoff.
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                log.warning(
+                    "%s fetching %s (attempt %d/%d), retrying in %ds…",
+                    type(e).__name__, url, attempt + 1, max_attempts, wait,
+                )
+                if attempt < max_attempts - 1:
+                    time.sleep(wait)
+                else:
+                    raise
+        # All retries exhausted on a retryable HTTP status — raise the last response.
+        resp.raise_for_status()
+        return resp  # unreachable, but keeps the type checker happy
+
+    # httpx.Client accepts proxy=None as a no-op (direct connection),
+    # so the same code path handles both proxied and direct modes.
     with httpx.Client(
         headers=DEFAULT_HEADERS,
         timeout=30.0,
         follow_redirects=True,
+        proxy=proxy_url,
     ) as client:
-        # Step 1: Fetch the sitemap index to get sub-sitemap URLs
-        resp = client.get(SITEMAP_INDEX_URL)
-        resp.raise_for_status()
+        # Step 1: Fetch the sitemap index to get sub-sitemap URLs.
+        resp = _get_with_retry(client, SITEMAP_INDEX_URL)
         ns = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9"}
         root = ET.fromstring(resp.text)
         sitemap_urls = [
@@ -204,11 +263,10 @@ def fetch_product_urls() -> list[str]:
         ]
         log.info("Found %d sub-sitemaps.", len(sitemap_urls))
 
-        # Step 2: Fetch each sub-sitemap and extract product URLs
+        # Step 2: Fetch each sub-sitemap and extract product URLs.
         all_product_urls: list[str] = []
         for sm_url in sitemap_urls:
-            resp = client.get(sm_url)
-            resp.raise_for_status()
+            resp = _get_with_retry(client, sm_url)
             sm_root = ET.fromstring(resp.text)
             urls = [
                 loc.text
@@ -633,19 +691,21 @@ async def async_main(limit: int | None = None) -> None:
     """
     log.info("=== Stephanis scraper starting ===")
 
-    # 1. Parse sitemap to get all product URLs
-    product_urls = fetch_product_urls()
+    # 1. Build the proxy pool BEFORE sitemap discovery: the sitemap lives on
+    # the same Cloudflare-protected host as the product pages, so the very
+    # first request must already go through a residential IP in CI.
+    # If no proxy env vars are set, the pool is empty and we fall back
+    # to a direct connection (the normal local-development path).
+    proxies = proxy_pool.build_proxy_urls()
+
+    # 2. Parse sitemap to get all product URLs.
+    # Sitemap discovery is a few dozen sequential requests — one proxy IP
+    # is enough.  Empty pool → None → direct (local development path).
+    product_urls = fetch_product_urls(proxy_url=proxies[0] if proxies else None)
 
     if limit:
         log.info("TEST MODE: limiting to first %d products.", limit)
         product_urls = product_urls[:limit]
-
-    # 2. Build the proxy pool (if configured).
-    # Stephanis is behind Cloudflare with IP-based challenges, so
-    # datacenter IPs are blocked.  Residential proxy IPs bypass this.
-    # If no proxy env vars are set, the pool is empty and we fall back
-    # to a direct connection (the normal local-development path).
-    proxies = proxy_pool.build_proxy_urls()
 
     # 3. Fetch all product pages and parse immediately (saves memory).
     # When proxies are available, requests are distributed round-robin
