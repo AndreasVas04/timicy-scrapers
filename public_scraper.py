@@ -73,14 +73,28 @@ SITEMAP_NS = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 PRODUCT_API_URL = f"{BASE_URL}/public/v2/sku/{{product_id}}"
 
 # Concurrency and rate-limiting settings.
-# Public.cy has ~88k products.  The API responds fast (~150ms) but
-# we keep concurrency moderate to avoid overwhelming their servers.
-# At 5 concurrent with 200ms delay, ~88k products takes ~50 minutes.
-INITIAL_CONCURRENCY = 5       # Max concurrent HTTP requests
+# Public.cy is behind Akamai with a token-bucket rate limit (capacity
+# ~120 requests).  At >4 req/sec the bucket drains and Akamai responds
+# with 403.  Measured safe sustained rates from probing: 1.76 and 3.98
+# req/sec both produced zero 403s over 300 unique SKUs each.  We target
+# 2.5 req/sec as a conservative CI operating point.
+INITIAL_CONCURRENCY = 5       # Max in-flight HTTP requests (semaphore cap)
 MIN_CONCURRENCY = 1           # Floor when auto-throttling on 429s
-REQUEST_DELAY = 0.2           # Seconds between requests per coroutine
-MAX_RETRIES = 3               # Retry attempts on 429 / 5xx responses
+MAX_RETRIES = 3               # Retry attempts on 429 / 403 / 5xx responses
 PROGRESS_INTERVAL = 500       # Log progress every N products
+
+# Global rate cap: maximum requests per second across ALL coroutines.
+# This is the single pacing mechanism — the semaphore only caps in-flight
+# requests, while the RateLimiter enforces a minimum interval between
+# request starts.  Can be overridden via the PUBLIC_SCRAPER_RATE env var.
+TARGET_REQUESTS_PER_SEC = 2.5
+
+# 403 cooldown: Akamai returns 403 (not 429) when the token bucket is
+# exhausted.  A burst of consecutive 403s means the bucket is empty and
+# we must pause to let it refill.  Measured recovery: ~27s of silence
+# refills the bucket; 45s adds margin.
+FORBIDDEN_STREAK_THRESHOLD = 10   # consecutive 403s that trigger a cooldown
+FORBIDDEN_COOLDOWN_SECONDS = 45   # pause duration to let the bucket refill
 
 # Matches Apple-style part numbers like "MH344TY/A" or "MQDT3ZM/A".
 # Captures the region-independent root (e.g. "MH344") before the
@@ -419,6 +433,90 @@ def parse_api_response(data: dict, product_id: str) -> VariantRow | None:
     )
 
 
+# ── Global rate limiter ───────────────────────────────────────────────────
+
+class RateLimiter:
+    """Asyncio-safe pacer that enforces a maximum global request rate.
+
+    Maintains a "next allowed" timestamp.  Each call to acquire() sleeps
+    until its time slot, then advances the timestamp by 1/rate seconds.
+    This guarantees that no matter how many coroutines call acquire()
+    concurrently, the true request-start rate never exceeds `rate` per
+    second.
+
+    The semaphore in AdaptiveFetcher caps *in-flight* requests; this
+    class caps *request starts*.  Both are needed: the semaphore prevents
+    memory bloat from thousands of pending responses, while the rate
+    limiter prevents the token-bucket drain that triggers Akamai 403s.
+    """
+
+    def __init__(self, rate: float) -> None:
+        self._interval = 1.0 / rate        # minimum seconds between request starts
+        self._lock = asyncio.Lock()         # serialises slot assignment
+        self._next_allowed = 0.0            # monotonic timestamp of next open slot
+
+    async def acquire(self) -> None:
+        """Wait until the next available time slot, then claim it."""
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            # If we're ahead of schedule, sleep until the slot opens.
+            if now < self._next_allowed:
+                await asyncio.sleep(self._next_allowed - now)
+            # Advance the slot for the next caller.
+            self._next_allowed = max(now, self._next_allowed) + self._interval
+
+
+class ForbiddenTracker:
+    """Asyncio-safe tracker for consecutive HTTP 403 responses.
+
+    Akamai returns 403 (not 429) when its token bucket is exhausted.
+    A burst of consecutive 403s means the bucket is empty and we must
+    pause to let it refill.  Any non-403 outcome resets the counter,
+    because isolated 403s can be per-product blocks (not rate walls).
+    """
+
+    def __init__(self, threshold: int, cooldown: float) -> None:
+        self._threshold = threshold          # consecutive 403s that trigger a cooldown
+        self._cooldown = cooldown            # seconds to sleep when the wall is hit
+        self._lock = asyncio.Lock()          # protects _streak and _cooling_down
+        self._streak = 0                     # current consecutive-403 count
+        self._cooling_down = False           # True while a cooldown sleep is active
+
+    async def record_403(self) -> bool:
+        """Record a 403 response.  Returns True if a cooldown was triggered.
+
+        When the streak reaches the threshold AND no cooldown is already
+        in progress, logs a warning and sleeps for the cooldown duration.
+        Other coroutines that hit 403 during the cooldown will see
+        _cooling_down=True and wait for it to finish rather than
+        triggering additional overlapping cooldowns.
+        """
+        async with self._lock:
+            self._streak += 1
+            if self._streak >= self._threshold and not self._cooling_down:
+                self._cooling_down = True
+                log.warning(
+                    "403 wall detected (%d consecutive) — cooling down for %ds.",
+                    self._streak, self._cooldown,
+                )
+                # Release the lock during sleep so other coroutines can
+                # check _cooling_down and skip duplicate cooldowns.
+                self._lock.release()
+                try:
+                    await asyncio.sleep(self._cooldown)
+                finally:
+                    await self._lock.acquire()
+                self._streak = 0
+                self._cooling_down = False
+                return True
+            return False
+
+    async def reset(self) -> None:
+        """Reset the streak counter on any non-403 outcome."""
+        async with self._lock:
+            self._streak = 0
+
+
 # ── Adaptive async fetcher ────────────────────────────────────────────────
 
 class AdaptiveFetcher:
@@ -462,24 +560,35 @@ class AdaptiveFetcher:
         self,
         client: httpx.AsyncClient,
         product_id: str,
+        rate_limiter: RateLimiter,
+        forbidden_tracker: ForbiddenTracker,
     ) -> tuple[str, dict | None]:
         """Fetch a product's JSON from the API with retries.
 
         Returns (product_id, json_data) on success, or (product_id, None)
-        if all retries fail.  Handles 429s, 5xx errors, timeouts, and
-        connection errors with exponential backoff.
+        if all retries fail.  Handles 403s (Akamai rate wall with cooldown),
+        429s (explicit rate-limit with concurrency reduction), 5xx errors,
+        timeouts, and connection errors with exponential backoff.
+
+        The rate_limiter.acquire() call immediately before each client.get()
+        is the single global pacing mechanism: it enforces a minimum interval
+        between request starts across all coroutines.  The semaphore caps
+        in-flight requests but does not pace them.
         """
         url = PRODUCT_API_URL.format(product_id=product_id)
 
         async with self._semaphore:
-            # Polite delay to pace requests
-            await asyncio.sleep(REQUEST_DELAY)
-
             for attempt in range(MAX_RETRIES):
                 try:
+                    # Wait for the global rate limiter before sending.
+                    # This is the only pacing mechanism — it enforces the
+                    # target req/sec across all concurrent coroutines.
+                    await rate_limiter.acquire()
                     resp = await client.get(url)
 
                     if resp.status_code == 200:
+                        # Reset the 403 streak on any successful response.
+                        await forbidden_tracker.reset()
                         # Some products return empty body or non-JSON on 200
                         if not resp.text.strip():
                             return (product_id, None)
@@ -489,10 +598,31 @@ class AdaptiveFetcher:
                             return (product_id, None)
 
                     if resp.status_code == 404:
-                        # Product doesn't exist — skip silently
+                        # Product doesn't exist — skip silently.
+                        # Still counts as a non-403 outcome for streak purposes.
+                        await forbidden_tracker.reset()
                         return (product_id, None)
 
+                    if resp.status_code == 403:
+                        # Akamai token-bucket exhausted — retryable with
+                        # cooldown awareness.  If the streak reaches the
+                        # threshold, the tracker pauses all coroutines for
+                        # FORBIDDEN_COOLDOWN_SECONDS to let the bucket refill.
+                        triggered = await forbidden_tracker.record_403()
+                        if not triggered:
+                            # Below threshold — normal exponential backoff.
+                            wait = 2 ** attempt
+                            log.warning(
+                                "HTTP 403 for %s (attempt %d), retrying in %ds…",
+                                product_id, attempt + 1, wait,
+                            )
+                            await asyncio.sleep(wait)
+                        # If triggered, the tracker already slept the cooldown.
+                        continue
+
                     if resp.status_code == 429 or resp.status_code >= 500:
+                        # Reset 403 streak — this is a different error class.
+                        await forbidden_tracker.reset()
                         if resp.status_code == 429:
                             self._reduce_concurrency()
                         wait = 2 ** attempt
@@ -503,11 +633,13 @@ class AdaptiveFetcher:
                         await asyncio.sleep(wait)
                         continue
 
-                    # Non-retryable error (e.g. 403)
+                    # Other non-retryable errors (e.g. 400, 405).
+                    await forbidden_tracker.reset()
                     log.debug("HTTP %s for %s — skipping", resp.status_code, product_id)
                     return (product_id, None)
 
                 except httpx.TooManyRedirects:
+                    await forbidden_tracker.reset()
                     log.debug("Redirect loop for %s — skipping", product_id)
                     return (product_id, None)
 
@@ -519,6 +651,7 @@ class AdaptiveFetcher:
                     httpx.WriteError,
                     httpx.CloseError,
                 ) as e:
+                    await forbidden_tracker.reset()
                     wait = 2 ** attempt
                     log.warning(
                         "%s for %s (attempt %d), retrying in %ds…",
@@ -536,11 +669,16 @@ class AdaptiveFetcher:
 async def fetch_and_parse_all(
     product_ids: list[str],
     fetcher: AdaptiveFetcher,
+    rate_limiter: RateLimiter,
+    forbidden_tracker: ForbiddenTracker,
 ) -> tuple[list[VariantRow], list[str], int, int]:
     """Fetch all products from the API and parse them immediately.
 
     Each API response is parsed right after fetching — the raw JSON is
     discarded so memory stays bounded.
+
+    The rate_limiter and forbidden_tracker are shared across all
+    coroutines to enforce global pacing and 403 cooldown behaviour.
 
     Returns:
       - rows: list of parsed VariantRow objects
@@ -573,7 +711,10 @@ async def fetch_and_parse_all(
         while idx < total:
             batch_size = fetcher.concurrency * 10
             batch_ids = product_ids[idx : idx + batch_size]
-            tasks = [fetcher.fetch_json(client, pid) for pid in batch_ids]
+            tasks = [
+                fetcher.fetch_json(client, pid, rate_limiter, forbidden_tracker)
+                for pid in batch_ids
+            ]
             results = await asyncio.gather(*tasks)
             idx += len(batch_ids)
 
@@ -648,18 +789,43 @@ async def async_main(limit: int | None = None) -> None:
     """
     log.info("=== Public.cy scraper starting ===")
 
-    # 1. Parse sitemap to get all product IDs
+    # 1. Determine the effective global rate cap.
+    # The default (TARGET_REQUESTS_PER_SEC = 2.5) is conservative for
+    # Akamai's token bucket.  An optional env var allows tuning without
+    # code changes (e.g. for testing a faster rate in a controlled run).
+    effective_rate = TARGET_REQUESTS_PER_SEC
+    rate_override = os.environ.get("PUBLIC_SCRAPER_RATE", "").strip()
+    if rate_override:
+        try:
+            effective_rate = float(rate_override)
+        except ValueError:
+            log.warning("Invalid PUBLIC_SCRAPER_RATE=%r — using default %.1f",
+                        rate_override, TARGET_REQUESTS_PER_SEC)
+    log.info("Global rate cap: %.1f req/sec", effective_rate)
+
+    # 2. Parse sitemap to get all product IDs
     product_ids = fetch_product_ids()
 
     if limit:
         log.info("TEST MODE: limiting to first %d products.", limit)
         product_ids = product_ids[:limit]
 
-    # 2. Fetch all products from API and parse immediately
+    # 3. Create the shared rate limiter and 403 tracker.
+    # - RateLimiter enforces a minimum interval between request starts
+    #   across ALL coroutines (the single global pacing mechanism).
+    # - ForbiddenTracker detects Akamai's 403 rate wall and triggers a
+    #   cooldown pause to let the token bucket refill.
+    rate_limiter = RateLimiter(rate=effective_rate)
+    forbidden_tracker = ForbiddenTracker(
+        threshold=FORBIDDEN_STREAK_THRESHOLD,
+        cooldown=FORBIDDEN_COOLDOWN_SECONDS,
+    )
+
+    # 4. Fetch all products from API and parse immediately
     log.info("Fetching %d products from API…", len(product_ids))
     fetcher = AdaptiveFetcher(max_concurrency=INITIAL_CONCURRENCY)
     rows, failures, success_count, skip_count = await fetch_and_parse_all(
-        product_ids, fetcher,
+        product_ids, fetcher, rate_limiter, forbidden_tracker,
     )
     log.info(
         "Parsed %d rows — %d API successes, %d skipped, %d failures.",
