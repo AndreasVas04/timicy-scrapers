@@ -50,4 +50,11 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           REVALIDATE_URL: ${{ secrets.REVALIDATE_URL }}
           REVALIDATE_SECRET: ${{ secrets.REVALIDATE_SECRET }}
+          # Residential proxy pool for stephanis (Cloudflare IP-based block).
+          # If any of these four are missing, stephanis falls back to direct
+          # connection (which will be blocked in CI — set all four in repo secrets).
+          SCRAPER_PROXY_HOST: ${{ secrets.SCRAPER_PROXY_HOST }}
+          SCRAPER_PROXY_USER: ${{ secrets.SCRAPER_PROXY_USER }}
+          SCRAPER_PROXY_PASS: ${{ secrets.SCRAPER_PROXY_PASS }}
+          SCRAPER_PROXY_PORTS: ${{ secrets.SCRAPER_PROXY_PORTS }}
         run: python run_nightly.py
