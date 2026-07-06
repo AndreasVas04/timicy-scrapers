@@ -56,7 +56,15 @@ NAV_MENU_URL = "https://new-content.kotsovolos.cy/content/kotsovolos/b2c/cy/home
 # locale suffix (e.g. "TY/A").  Non-matching SKUs are left as-is.
 APPLE_PN_RE = re.compile(r"^([A-Z0-9]{5,6})[A-Z]{1,3}/[A-Z]$")
 
-# Browser-like headers — the API rejects requests without a proper User-Agent.
+# Full browser header set for all HTTP requests.
+# Kotsovolos is behind Akamai, which blocks datacenter IPs unless the
+# request carries a complete, consistent set of browser headers.  A bare
+# User-Agent is not enough — Akamai fingerprints the full header profile
+# (sec-ch-ua, Sec-Fetch-*, etc.) and challenges requests that look
+# automated.  These headers match a real Chrome 125 on Windows and were
+# validated via curl from a GitHub Actions datacenter IP (HTTP 200).
+# Note: Accept stays as application/json because this scraper only hits
+# the JSON product-listing API, not HTML pages.
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -64,6 +72,15 @@ DEFAULT_HEADERS = {
         "Chrome/125.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json",
+    "Accept-Language": "el-CY,el;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 

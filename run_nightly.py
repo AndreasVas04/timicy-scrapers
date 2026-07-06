@@ -53,7 +53,7 @@ STORE_REGISTRY: list[tuple[str, str, int]] = [
     ("istorm",      "istorm_scraper.py",      2048),
     ("kotsovolos",  "kotsovolos_scraper.py",   8907),
     ("stephanis",   "stephanis_scraper.py",    26266),
-    ("electroline", "electroline_scraper.py",  8534),
+    ("electroline", "electroline_scraper.py",  9354),
     ("public",      "public_scraper.py",       11792),
     ("bionic",      "bionic_scraper.py",       5180),
 ]

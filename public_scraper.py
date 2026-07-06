@@ -95,14 +95,29 @@ APPLE_PN_RE = re.compile(r"^([A-Z0-9]{5,6})[A-Z]{1,3}/[A-Z]$")
 #     are often descriptive (e.g. "(4 years)", "(2nd Gen)")
 MPN_TITLE_RE = re.compile(r"\(([A-Z0-9][A-Z0-9\-/]{4,})\)")
 
-# Browser-like headers for the API requests.
+# Full browser header set for all HTTP requests.
+# Public.cy is behind Akamai, which blocks datacenter IPs unless the
+# request carries a complete, consistent set of browser headers.  A bare
+# User-Agent is not enough — Akamai fingerprints the full header profile
+# (sec-ch-ua, Sec-Fetch-*, etc.) and challenges requests that look
+# automated.  These headers match a real Chrome 125 on Windows and were
+# validated via curl from a GitHub Actions datacenter IP (HTTP 200).
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/125.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "el-CY,el;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "sec-ch-ua": '"Chromium";v="125", "Not.A/Brand";v="24"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # Greek text values that indicate the product is in stock.

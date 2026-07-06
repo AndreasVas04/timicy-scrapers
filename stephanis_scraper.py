@@ -26,6 +26,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -33,6 +34,8 @@ from typing import Any
 
 import httpx
 from pydantic import BaseModel, Field
+
+import proxy_pool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -448,12 +451,23 @@ class AdaptiveFetcher:
 
 async def fetch_and_parse_all(
     urls: list[str],
-    fetcher: AdaptiveFetcher,
+    proxy_urls: list[str] | None = None,
 ) -> tuple[list[VariantRow], list[str], int, int]:
     """Fetch all product pages and parse them immediately to save memory.
 
     Parses each page right after fetching (discarding raw HTML) so we
     never hold 26K HTML strings in memory simultaneously.
+
+    If proxy_urls is provided and non-empty, creates one httpx.AsyncClient
+    per proxy URL and distributes product-page requests across them in a
+    round-robin pattern.  Each client gets its own AdaptiveFetcher with
+    the same concurrency limit, so per-client request rate stays the same
+    as the direct (no-proxy) path.  This spreads the ~26k requests evenly
+    across multiple residential IPs to avoid Cloudflare's per-IP rate
+    limits.
+
+    If proxy_urls is empty or None, falls back to a single direct client
+    with no proxy — identical to the previous behaviour.
 
     Returns:
       - rows: list of parsed VariantRow objects
@@ -469,24 +483,71 @@ async def fetch_and_parse_all(
     completed = 0
     start_time = time.monotonic()
 
-    async with httpx.AsyncClient(
-        headers=DEFAULT_HEADERS,
-        timeout=30.0,
-        follow_redirects=True,
-        limits=httpx.Limits(
-            max_connections=INITIAL_CONCURRENCY * 2,
-            max_keepalive_connections=INITIAL_CONCURRENCY,
-        ),
-    ) as client:
-        # Batch size adapts to the current concurrency limit so that
-        # after a 429 throttle reduces _max_concurrency, future batches
-        # spawn fewer concurrent tasks (the semaphore alone cannot be
-        # resized, but smaller batches achieve the same effect).
+    # Connection pool limits applied to every client (direct or proxied).
+    client_limits = httpx.Limits(
+        max_connections=INITIAL_CONCURRENCY * 2,
+        max_keepalive_connections=INITIAL_CONCURRENCY,
+    )
+
+    async with AsyncExitStack() as stack:
+        # Build the list of (client, fetcher) pairs.
+        # - With proxies: one pair per proxy URL (round-robin distribution).
+        # - Without proxies: a single pair using a direct connection.
+        clients: list[httpx.AsyncClient] = []
+        fetchers: list[AdaptiveFetcher] = []
+
+        if proxy_urls:
+            # Create one client per proxy, each bound to a single
+            # residential IP via the proxy= argument.  Each client gets
+            # its own AdaptiveFetcher so that per-client concurrency
+            # (and any 429-triggered throttling) is independent.
+            for proxy_url in proxy_urls:
+                client = await stack.enter_async_context(
+                    httpx.AsyncClient(
+                        headers=DEFAULT_HEADERS,
+                        timeout=30.0,
+                        follow_redirects=True,
+                        proxy=proxy_url,
+                        limits=client_limits,
+                    )
+                )
+                clients.append(client)
+                fetchers.append(AdaptiveFetcher(max_concurrency=INITIAL_CONCURRENCY))
+            # Log count only — NEVER log proxy URLs (they contain credentials).
+            log.info("Using %d proxy client(s) for product page fetches.", len(clients))
+        else:
+            # No proxies configured — single direct client (local dev
+            # or stores that don't need residential IPs).
+            client = await stack.enter_async_context(
+                httpx.AsyncClient(
+                    headers=DEFAULT_HEADERS,
+                    timeout=30.0,
+                    follow_redirects=True,
+                    limits=client_limits,
+                )
+            )
+            clients.append(client)
+            fetchers.append(AdaptiveFetcher(max_concurrency=INITIAL_CONCURRENCY))
+            log.info("Using direct connection (no proxy).")
+
+        num_clients = len(clients)
+
+        # Batch size adapts to the sum of all fetchers' concurrency so
+        # that after a 429 throttle reduces one fetcher's limit, future
+        # batches shrink proportionally.
         idx = 0
         while idx < total:
-            batch_size = fetcher.concurrency * 10
+            total_concurrency = sum(f.concurrency for f in fetchers)
+            batch_size = total_concurrency * 10
             batch_urls = urls[idx : idx + batch_size]
-            tasks = [fetcher.fetch(client, url) for url in batch_urls]
+
+            # Assign each URL to a (client, fetcher) pair round-robin.
+            # This distributes requests evenly across proxy IPs.
+            tasks = []
+            for j, url in enumerate(batch_urls):
+                ci = (idx + j) % num_clients
+                tasks.append(fetchers[ci].fetch(clients[ci], url))
+
             results = await asyncio.gather(*tasks)
             idx += len(batch_urls)
 
@@ -505,11 +566,12 @@ async def fetch_and_parse_all(
                 if completed % PROGRESS_INTERVAL == 0 or completed == total:
                     elapsed = time.monotonic() - start_time
                     rate = completed / elapsed if elapsed > 0 else 0
+                    total_concurrency = sum(f.concurrency for f in fetchers)
                     log.info(
                         "Progress: %d/%d (%.1f%%) — %.1f pages/sec — "
-                        "concurrency=%d — %d failures",
+                        "concurrency=%d (across %d client(s)) — %d failures",
                         completed, total, 100 * completed / total,
-                        rate, fetcher.concurrency, len(failures),
+                        rate, total_concurrency, num_clients, len(failures),
                     )
 
     return rows, failures, jsonld_count, fallback_count
@@ -578,11 +640,19 @@ async def async_main(limit: int | None = None) -> None:
         log.info("TEST MODE: limiting to first %d products.", limit)
         product_urls = product_urls[:limit]
 
-    # 2. Fetch all product pages and parse immediately (saves memory)
+    # 2. Build the proxy pool (if configured).
+    # Stephanis is behind Cloudflare with IP-based challenges, so
+    # datacenter IPs are blocked.  Residential proxy IPs bypass this.
+    # If no proxy env vars are set, the pool is empty and we fall back
+    # to a direct connection (the normal local-development path).
+    proxies = proxy_pool.build_proxy_urls()
+
+    # 3. Fetch all product pages and parse immediately (saves memory).
+    # When proxies are available, requests are distributed round-robin
+    # across the proxy IPs so each IP handles ~1/N of the load.
     log.info("Fetching %d product pages…", len(product_urls))
-    fetcher = AdaptiveFetcher(max_concurrency=INITIAL_CONCURRENCY)
     rows, failures, jsonld_count, fallback_count = await fetch_and_parse_all(
-        product_urls, fetcher,
+        product_urls, proxy_urls=proxies,
     )
     log.info(
         "Parsed %d rows — %d from JSON-LD, %d pages missing JSON-LD, %d failures.",
