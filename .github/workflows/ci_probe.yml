@@ -2,23 +2,30 @@
 # ci_probe.yml — THROWAWAY diagnostic workflow (safe to delete after use)
 #
 # Purpose:
-#   Probe whether non-www hosts / subdomains of stephanis.com.cy bypass
-#   Cloudflare.  Many small sites only protect www — if the apex domain
-#   or a subdomain (api, assets, cdn) serves the same content without a
-#   CF challenge, the scraper can hit it directly from the datacenter IP.
+#   Test whether search-engine crawler User-Agents (Googlebot, Bingbot)
+#   bypass Cloudflare on stephanis.com.cy.  Many sites whitelist Googlebot
+#   by UA string for SEO (JSON-LD rich results, sitemap access) without
+#   enabling Cloudflare's reverse-DNS verified-bot validation — especially
+#   on small / free Cloudflare plans.
 #
-# Also checks DNS resolution (Cloudflare IPs vs origin) and queries the
-# Wayback Machine availability API for an archived sitemap snapshot.
+# Hypothesis:
+#   stephanis is an SSR site serving JSON-LD product data for Google rich
+#   results.  If Cloudflare only checks the User-Agent string (not the
+#   reverse-DNS origin of the request), a Googlebot UA from a datacenter
+#   IP should pass the challenge.
 #
 # What this workflow does NOT do:
 #   - does NOT run any scraper
 #   - does NOT touch the database
 #   - does NOT use any repository secret or proxy
 #   - does NOT import or modify any existing repo code
+#   - does NOT send sec-ch-ua or Sec-Fetch-* headers (real crawlers never
+#     send these — sending them would contradict the crawler UA and could
+#     trigger Cloudflare's header-mismatch detection)
 #
 # It is a read-only network probe whose results are printed to the job log.
 # ---------------------------------------------------------------------------
-name: CI Probe (stephanis host/subdomain Cloudflare bypass)
+name: CI Probe (stephanis Googlebot/Bingbot UA bypass)
 
 on:
   # Manual trigger only — never runs on push or on a schedule.
@@ -30,24 +37,25 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: Probe stephanis hosts and subdomains
+      - name: Probe stephanis with crawler User-Agents
         shell: bash
         run: |
           set +e +o pipefail
 
-          # --- Common browser headers used on every request ---
-          BROWSER_HEADERS=(
-            -H 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
-            -H 'Accept-Language: el-CY,el;q=0.9,en;q=0.8'
+          # =================================================================
+          # Configuration
+          # =================================================================
+
+          # The two target URLs to probe.
+          PRODUCT_URL="https://www.stephanis.com.cy/en/products/410161"
+          SITEMAP_URL="https://www.stephanis.com.cy/sitemap.xml"
+
+          # Accept headers that real crawlers send (no sec-ch-ua, no
+          # Sec-Fetch-* — those are browser-only and would contradict
+          # the crawler UA, potentially triggering mismatch detection).
+          ACCEPT_HEADERS=(
+            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
             -H 'Accept-Encoding: gzip, deflate, br'
-            -H 'sec-ch-ua: "Chromium";v="124", "Not.A/Brand";v="24"'
-            -H 'sec-ch-ua-mobile: ?0'
-            -H 'sec-ch-ua-platform: "Windows"'
-            -H 'Sec-Fetch-Dest: document'
-            -H 'Sec-Fetch-Mode: navigate'
-            -H 'Sec-Fetch-Site: none'
-            -H 'Upgrade-Insecure-Requests: 1'
           )
 
           # --- Show the runner's public IP (confirms datacenter, no proxy) ---
@@ -60,67 +68,40 @@ jobs:
           echo ""
 
           # =================================================================
-          # SECTION 1 — DNS resolution check
-          #   Cloudflare proxied domains resolve to 104.x / 172.x ranges.
-          #   An origin IP (e.g. a hosting provider) means no CF proxy.
+          # probe_url — fetches a URL, prints diagnostics + verdict
+          #
+          # Arguments:
+          #   $1 — human-readable label for this probe
+          #   $2 — target URL
+          #   $3 — User-Agent string
           # =================================================================
-          echo "============================================================"
-          echo "=== DNS Resolution ==="
-          echo "============================================================"
-          echo ""
-          echo "--- dig +short stephanis.com.cy (apex) ---"
-          dig +short stephanis.com.cy || echo "(dig failed)"
-          echo ""
-          echo "--- dig +short www.stephanis.com.cy ---"
-          dig +short www.stephanis.com.cy || echo "(dig failed)"
-          echo ""
-
-          # =================================================================
-          # SECTION 2 — Main URL probes (full browser headers, GET)
-          #   For each URL: print status, server header, cf-mitigated header,
-          #   first 200 chars of body, and a verdict line.
-          # =================================================================
-
           probe_url() {
-            # $1 = label, $2 = URL
             local LABEL="$1"
             local URL="$2"
+            local UA="$3"
 
             echo "============================================================"
             echo "=== $LABEL ==="
             echo "URL: $URL"
+            echo "UA:  $UA"
             echo "============================================================"
 
-            # Fetch into a temp file so we can inspect headers + body separately.
-            local TMPFILE
-            TMPFILE=$(mktemp)
-
-            local HTTP_CODE
-            HTTP_CODE=$(curl -s -o "$TMPFILE" -D - \
-              --max-time 20 --compressed \
-              "${BROWSER_HEADERS[@]}" \
-              -w '\n%{http_code}' \
-              "$URL" 2>/dev/null)
-
-            # The last line of output is the HTTP status code (-w format).
-            # Everything before it is the response headers + body in $TMPFILE.
-            # curl -D - writes headers to stdout; -o writes body to file.
-            # We re-do this more cleanly: headers to one file, body to another.
-            rm -f "$TMPFILE"
-
-            local HDR_FILE BODY_FILE
+            # Fetch headers into one file, body into another.
+            local HDR_FILE BODY_FILE HTTP_CODE
             HDR_FILE=$(mktemp)
             BODY_FILE=$(mktemp)
 
             HTTP_CODE=$(curl -s -D "$HDR_FILE" -o "$BODY_FILE" \
               --max-time 20 --compressed \
-              "${BROWSER_HEADERS[@]}" \
+              -H "User-Agent: $UA" \
+              "${ACCEPT_HEADERS[@]}" \
               -w '%{http_code}' \
               "$URL" 2>/dev/null)
 
+            # --- Print HTTP status ---
             echo "HTTP status:   $HTTP_CODE"
 
-            # Extract key headers.
+            # --- Extract key response headers ---
             local SERVER CF_MITIGATED
             SERVER=$(grep -i '^server:' "$HDR_FILE" | head -1 | sed 's/^[^:]*: //' | tr -d '\r')
             CF_MITIGATED=$(grep -i '^cf-mitigated:' "$HDR_FILE" | head -1 | sed 's/^[^:]*: //' | tr -d '\r')
@@ -128,7 +109,7 @@ jobs:
             echo "server:        ${SERVER:-(not present)}"
             echo "cf-mitigated:  ${CF_MITIGATED:-(not present)}"
 
-            # Body preview — first 200 chars.
+            # --- Body preview: first 200 characters ---
             local BODY_PREVIEW
             BODY_PREVIEW=$(head -c 200 "$BODY_FILE" 2>/dev/null)
             echo ""
@@ -137,101 +118,99 @@ jobs:
             echo ""
 
             # --- Verdict ---
-            local BODY_FULL
+            local BODY_FULL VERDICT
             BODY_FULL=$(cat "$BODY_FILE" 2>/dev/null)
 
             if [[ -n "$CF_MITIGATED" ]]; then
-              echo ">>> VERDICT: CLOUDFLARE CHALLENGE (cf-mitigated header present)"
-            elif echo "$BODY_FULL" | grep -q "Just a moment"; then
-              echo ">>> VERDICT: CLOUDFLARE CHALLENGE (body contains 'Just a moment')"
+              # cf-mitigated header is present → Cloudflare actively blocked.
+              VERDICT="CHALLENGED (cf-mitigated header present)"
+            elif echo "$BODY_FULL" | grep -qi "Just a moment"; then
+              # Cloudflare challenge page detected in body.
+              VERDICT="CHALLENGED (body contains 'Just a moment')"
             elif [[ "$HTTP_CODE" == "200" ]]; then
-              echo ">>> VERDICT: CLEAN (no Cloudflare block)"
+              # Status 200 — check for real content indicators.
+              if echo "$BODY_FULL" | grep -q '<?xml'; then
+                VERDICT="CLEAN — passed (body contains '<?xml')"
+              elif echo "$BODY_FULL" | grep -q 'application/ld+json'; then
+                VERDICT="CLEAN — passed (body contains 'application/ld+json')"
+              elif echo "$BODY_FULL" | grep -q 'productID'; then
+                VERDICT="CLEAN — passed (body contains 'productID')"
+              else
+                VERDICT="CLEAN — passed (status 200, no challenge markers)"
+              fi
             else
-              echo ">>> VERDICT: UNCLEAR — status $HTTP_CODE, inspect body above"
+              VERDICT="UNCLEAR — HTTP $HTTP_CODE, inspect body above"
             fi
 
+            echo ">>> VERDICT: $VERDICT"
             echo ""
+
+            # Store verdict for the summary table at the end.
+            VERDICTS+=("$LABEL | $VERDICT")
+
             rm -f "$HDR_FILE" "$BODY_FILE"
           }
 
-          # Probe 1 — www sitemap (known-blocked baseline)
-          probe_url "Probe 1: www sitemap (known-blocked baseline)" \
-            "https://www.stephanis.com.cy/sitemap.xml"
-
-          # Probe 2 — apex domain sitemap (no www)
-          probe_url "Probe 2: apex domain sitemap (no www)" \
-            "https://stephanis.com.cy/sitemap.xml"
-
-          # Probe 3 — www product page (real product from data dump)
-          probe_url "Probe 3: www product page" \
-            "https://www.stephanis.com.cy/en/products/410161"
-
-          # Probe 4 — apex product page (same product, no www)
-          probe_url "Probe 4: apex product page (no www)" \
-            "https://stephanis.com.cy/en/products/410161"
+          # =================================================================
+          # Array to collect verdicts for the summary table.
+          # =================================================================
+          VERDICTS=()
 
           # =================================================================
-          # SECTION 3 — Subdomain probes (api, assets, cdn)
-          #   These may not exist — wrap each so DNS failure prints a clean
-          #   line instead of aborting.
+          # User-Agent strings for the three crawler variants.
           # =================================================================
-          echo "============================================================"
-          echo "=== Subdomain probes (api / assets / cdn) ==="
-          echo "============================================================"
-          echo ""
 
-          probe_subdomain() {
-            # $1 = URL
-            local URL="$1"
-            local HOST
-            HOST=$(echo "$URL" | sed 's|https://||' | cut -d/ -f1)
+          # Googlebot desktop — the standard Googlebot crawler UA.
+          UA_GOOGLEBOT_DESKTOP="Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 
-            # Check if the host resolves at all.
-            if ! dig +short "$HOST" 2>/dev/null | grep -q .; then
-              echo "$URL — (no such host)"
-              return
-            fi
+          # Googlebot smartphone — mobile-first indexing variant.
+          UA_GOOGLEBOT_MOBILE="Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.84 Mobile Safari/537.36 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 
-            local HDR_FILE BODY_FILE HTTP_CODE
-            HDR_FILE=$(mktemp)
-            BODY_FILE=$(mktemp)
-
-            HTTP_CODE=$(curl -s -D "$HDR_FILE" -o "$BODY_FILE" \
-              --max-time 10 --compressed \
-              "${BROWSER_HEADERS[@]}" \
-              -w '%{http_code}' \
-              "$URL" 2>/dev/null)
-
-            local SERVER
-            SERVER=$(grep -i '^server:' "$HDR_FILE" | head -1 | sed 's/^[^:]*: //' | tr -d '\r')
-
-            echo "$URL — status: $HTTP_CODE, server: ${SERVER:-(none)} (resolves)"
-            rm -f "$HDR_FILE" "$BODY_FILE"
-          }
-
-          probe_subdomain "https://api.stephanis.com.cy"
-          probe_subdomain "https://assets.stephanis.com.cy"
-          probe_subdomain "https://cdn.stephanis.com.cy"
-          echo ""
+          # Bingbot — Microsoft's search crawler.
+          UA_BINGBOT="Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)"
 
           # =================================================================
-          # SECTION 4 — Wayback Machine availability API
-          #   archive.org is never Cloudflare-blocked. If a recent snapshot
-          #   of the sitemap exists, we can parse it for product URLs without
-          #   ever hitting stephanis directly.
+          # Probes: 3 UAs × 2 URLs = 6 probes
+          # =================================================================
+
+          # --- Googlebot desktop ---
+          probe_url "Googlebot desktop → product page" \
+            "$PRODUCT_URL" \
+            "$UA_GOOGLEBOT_DESKTOP"
+
+          probe_url "Googlebot desktop → sitemap" \
+            "$SITEMAP_URL" \
+            "$UA_GOOGLEBOT_DESKTOP"
+
+          # --- Googlebot smartphone ---
+          probe_url "Googlebot smartphone → product page" \
+            "$PRODUCT_URL" \
+            "$UA_GOOGLEBOT_MOBILE"
+
+          probe_url "Googlebot smartphone → sitemap" \
+            "$SITEMAP_URL" \
+            "$UA_GOOGLEBOT_MOBILE"
+
+          # --- Bingbot ---
+          probe_url "Bingbot → product page" \
+            "$PRODUCT_URL" \
+            "$UA_BINGBOT"
+
+          probe_url "Bingbot → sitemap" \
+            "$SITEMAP_URL" \
+            "$UA_BINGBOT"
+
+          # =================================================================
+          # Summary table — one line per probe with its verdict.
           # =================================================================
           echo "============================================================"
-          echo "=== Wayback Machine availability API ==="
+          echo "=== SUMMARY ==="
           echo "============================================================"
           echo ""
-          echo "Checking if an archived snapshot of the sitemap exists..."
+          for v in "${VERDICTS[@]}"; do
+            echo "  $v"
+          done
           echo ""
-          WAYBACK_JSON=$(curl -s --max-time 20 \
-            "https://archive.org/wayback/available?url=www.stephanis.com.cy/sitemap.xml")
-          echo "Raw JSON response:"
-          echo "$WAYBACK_JSON"
-          echo ""
-
           echo "============================================================"
           echo "=== DONE ==="
           echo "============================================================"
