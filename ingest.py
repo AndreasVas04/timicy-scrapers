@@ -481,7 +481,21 @@ def main():
             print(f"ERROR: Unknown store '{store}'. Valid: {', '.join(sorted(VALID_STORES))}")
             sys.exit(1)
 
-    with psycopg.connect(db_url) as conn:
+    # connect_timeout bounds TCP + auth establishment; keepalives detect
+    # a silently dead connection in ~1 minute.  No statement_timeout SET
+    # is added here: ingest runs multiple short transactions, and under
+    # Supavisor transaction-mode pooling a session-level SET does not
+    # reliably survive across transactions.  Ingest is instead bounded by
+    # the connect timeout, keepalives, and the pipeline-level stage
+    # timeout in run_nightly.py.
+    with psycopg.connect(
+        db_url,
+        connect_timeout=30,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    ) as conn:
         # Disable automatic prepared statements — they conflict with
         # pgbouncer transaction-mode pooling (which Supabase uses by
         # default), causing "DuplicatePreparedStatement" errors when a

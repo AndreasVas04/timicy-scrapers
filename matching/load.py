@@ -166,7 +166,36 @@ def get_connection() -> psycopg.Connection:
     if not db_url:
         print("ERROR: DATABASE_URL not set. Copy .env.example to .env and fill it in.")
         sys.exit(1)
-    return psycopg.connect(db_url)
+
+    # connect_timeout bounds the TCP + authentication handshake (the libpq
+    # default is infinite — a stalled connection attempt caused a 4-hour
+    # pipeline hang on 2026-07-06).
+    #
+    # keepalives detect a silently dead connection in roughly 1 minute
+    # instead of never:
+    #   keepalives=1        — enable TCP keepalives
+    #   keepalives_idle=30  — first probe 30s after last data
+    #   keepalives_interval=10 — re-probe every 10s
+    #   keepalives_count=3  — give up after 3 unanswered probes (~60s total)
+    conn = psycopg.connect(
+        db_url,
+        connect_timeout=30,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=3,
+    )
+
+    # Set a server-side statement timeout as the FIRST statement on the
+    # connection.  In Supavisor transaction-mode pooling this opens the
+    # transaction, pins the backend, and applies to every subsequent
+    # statement in that transaction.  The writer runs everything in one
+    # transaction, so this covers it end to end.  600s is ~30× the
+    # writer's normal total runtime (~20s).
+    with conn.cursor() as cur:
+        cur.execute("SET statement_timeout = '600s'")
+
+    return conn
 
 
 # ---------------------------------------------------------------------------

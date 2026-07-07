@@ -58,6 +58,17 @@ STORE_REGISTRY: list[tuple[str, str, int]] = [
     ("bionic",      "bionic_scraper.py",       5180),
 ]
 
+# Per-stage subprocess timeouts (seconds).  Normal runtimes are ~19s each,
+# so 1800s is ~90× headroom.  The purpose is to convert an infinite hang
+# (e.g. a stalled DB connection) into a fast, clearly-labeled stage failure
+# instead of waiting for the CI job-level timeout hours later.
+#
+# Scrapers intentionally have NO per-process timeout — their runtime varies
+# legitimately (longest store ~1h40m) and the CI job timeout remains their
+# backstop.
+INGEST_TIMEOUT_S = 1800
+WRITER_TIMEOUT_S = 1800
+
 REPO_ROOT = Path(__file__).resolve().parent
 DATA_DIR = REPO_ROOT / "data"
 LOGS_DIR = REPO_ROOT / "logs"
@@ -200,9 +211,19 @@ def run_ingest(passed_stores: list[str]) -> bool:
 
     Returns True on success, False on failure.  Output is streamed live
     to stdout so CI can see progress.
+
+    subprocess.run(timeout=...) kills the child on expiry.  A killed
+    ingest is upsert-idempotent and reconciles on the next successful
+    night.  Returning False feeds the existing FAILED/exit-2 flow
+    unchanged.
     """
+    print(f"  Stage timeout: {INGEST_TIMEOUT_S}s")
     cmd = [sys.executable, "ingest.py"] + passed_stores + ["--mark-disappeared"]
-    result = subprocess.run(cmd, cwd=str(REPO_ROOT))
+    try:
+        result = subprocess.run(cmd, cwd=str(REPO_ROOT), timeout=INGEST_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(f"\n[INGEST] TIMEOUT after {INGEST_TIMEOUT_S}s — process killed.")
+        return False
     return result.returncode == 0
 
 
@@ -214,11 +235,21 @@ def run_writer(dry_run: bool) -> bool:
     """Run the matching writer.  Under --dry-run the writer rolls back.
 
     Returns True on success, False on failure.  Output is streamed live.
+
+    subprocess.run(timeout=...) kills the child on expiry.  A killed
+    writer drops its connection and PostgreSQL rolls back its single
+    open transaction server-side, so no partial writes are possible.
+    Returning False feeds the existing FAILED/exit-2 flow unchanged.
     """
+    print(f"  Stage timeout: {WRITER_TIMEOUT_S}s")
     cmd = [sys.executable, "-m", "matching.writer"]
     if not dry_run:
         cmd.append("--write")
-    result = subprocess.run(cmd, cwd=str(REPO_ROOT))
+    try:
+        result = subprocess.run(cmd, cwd=str(REPO_ROOT), timeout=WRITER_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        print(f"\n[WRITER] TIMEOUT after {WRITER_TIMEOUT_S}s — process killed.")
+        return False
     return result.returncode == 0
 
 

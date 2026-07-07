@@ -310,10 +310,6 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
     """
     cur = conn.cursor()
 
-    # Disable the per-statement timeout for this session.  The default
-    # server-side limit can kill long-running write transactions.
-    cur.execute("SET statement_timeout = 0")
-
     # -- Pre-flight: count existing products for cold-vs-warm detection. --
     cur.execute("SELECT COUNT(*) FROM products")
     existing_product_count = cur.fetchone()[0]
@@ -921,6 +917,14 @@ def main() -> None:
     # Disable automatic prepared statements — they conflict with pgbouncer
     # transaction-mode pooling (which is what Supabase uses by default).
     conn.prepare_threshold = None
+
+    # Print the active server-side statement timeout so every CI log
+    # carries verbatim proof that the bound is in effect (nightly
+    # verification checklist item).
+    with conn.cursor() as cur:
+        cur.execute("SHOW statement_timeout")
+        print(f"statement_timeout: {cur.fetchone()[0]}")
+
     try:
         print("Loading offers...")
         offers = load_offers(conn)
