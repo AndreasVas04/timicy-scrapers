@@ -10,6 +10,7 @@ Coordinates the full data pipeline end-to-end:
   3. Ingest   — bulk-load validated stores into the database.
   4. Match    — run the matching writer to build/update canonical products.
   5. Revalidate — poke the web app's cache revalidation endpoint.
+  6. Alerts   — notify the web app to dispatch price-alert emails.
 
 Per-store failure isolation: a scraper crash or suspiciously small output
 excludes that store from ingestion but does NOT block the rest of the
@@ -299,18 +300,68 @@ def call_revalidate() -> bool | None:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6: Alerts — notify the web app to dispatch price-alert emails
+# ---------------------------------------------------------------------------
+
+def call_alerts_notify() -> bool | None:
+    """POST to the alerts notification endpoint to trigger price-alert emails.
+
+    Called after a successful writer run so that alert evaluation runs against
+    freshly-ingested prices.  The web app's /api/alerts/notify route checks
+    every active alert, compares current prices against thresholds, and queues
+    emails for any that fire.
+
+    Returns True on HTTP 200, False on any HTTP/network error, or None if the
+    required env vars are not configured (which is NOT treated as a failure —
+    local dev environments won't have the web app's alerts endpoint).
+
+    Reads ALERTS_NOTIFY_URL (the full endpoint URL) and ALERTS_CRON_SECRET
+    from the environment.  Timeout is 90s because the route may take up to
+    ~60s when a large batch of alert emails is queued for sending.
+    """
+    url = os.environ.get("ALERTS_NOTIFY_URL")
+    secret = os.environ.get("ALERTS_CRON_SECRET")
+
+    if not url or not secret:
+        print("  Alerts skipped (env not configured).")
+        return None
+
+    req = urllib.request.Request(
+        url,
+        method="POST",
+        headers={"Authorization": f"Bearer {secret}"},
+        data=b"",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=90) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print(f"  Alerts response: HTTP {resp.status}")
+            print(f"  Body: {body}")
+            return resp.status == 200
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+        print(f"  Alerts failed: HTTP {e.code}")
+        print(f"  Body: {body}")
+        return False
+    except (urllib.error.URLError, OSError) as e:
+        print(f"  Alerts failed: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Nightly pipeline orchestrator: scrape → ingest → match → revalidate.",
+        description="Nightly pipeline orchestrator: scrape → ingest → match → revalidate → alerts.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
         default=False,
-        help="Writer rolls back instead of committing; revalidation is skipped.",
+        help="Writer rolls back instead of committing; revalidation and alerts are skipped.",
     )
     parser.add_argument(
         "--skip-scrape",
@@ -430,6 +481,24 @@ def main() -> None:
         revalidate_elapsed = time.monotonic() - t0
         print(f"  {revalidate_elapsed:.1f}s elapsed.")
 
+    # -- Phase 6: Alerts --
+    # Only called when the writer succeeded and this is not a dry-run.
+    # Same gating as revalidation: if the writer failed or rolled back,
+    # there are no fresh prices to evaluate alerts against.
+    alerts_result: bool | None = None
+    alerts_elapsed = 0.0
+
+    if not writer_ok:
+        print("\n[ALERTS] Skipped — writer did not succeed.")
+    elif args.dry_run:
+        print("\n[ALERTS] Skipped (dry-run).")
+    else:
+        print("\n[ALERTS] Calling alerts notification endpoint...")
+        t0 = time.monotonic()
+        alerts_result = call_alerts_notify()
+        alerts_elapsed = time.monotonic() - t0
+        print(f"  {alerts_elapsed:.1f}s elapsed.")
+
     # -- Final summary --
     total_elapsed = time.monotonic() - pipeline_start
 
@@ -468,18 +537,29 @@ def main() -> None:
     else:
         print(f"  Revalidate:   FAILED  ({revalidate_elapsed:.1f}s)")
 
+    if args.dry_run:
+        print(f"  Alerts:       skipped (dry-run)")
+    elif alerts_result is None:
+        print(f"  Alerts:       skipped (env not configured)")
+    elif alerts_result:
+        print(f"  Alerts:       OK  ({alerts_elapsed:.1f}s)")
+    else:
+        print(f"  Alerts:       FAILED  ({alerts_elapsed:.1f}s)")
+
     print(f"\n  Total elapsed: {total_elapsed:.1f}s")
     print(f"{'=' * 60}")
 
     # -- Exit code --
     # 0 = all stores passed, all phases succeeded.
-    # 1 = partial success: some stores failed OR revalidation failed;
-    #     data was written, but CI must alert so someone investigates.
-    #     revalidate_result=None (env not configured) is NOT a failure.
+    # 1 = partial success: some stores failed, OR revalidation failed,
+    #     OR alerts failed; data was written, but CI must alert so
+    #     someone investigates.
+    #     revalidate_result=None / alerts_result=None (env not configured)
+    #     are NOT failures.
     # 2 = pipeline failure: ingest or writer errored out.
     if not ingest_ok or not writer_ok:
         sys.exit(2)
-    elif failures or revalidate_result is False:
+    elif failures or revalidate_result is False or alerts_result is False:
         sys.exit(1)
     else:
         sys.exit(0)
