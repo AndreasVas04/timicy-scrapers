@@ -28,7 +28,8 @@ Data sources per field:
   - product_type:     breadcrumb second-to-last item (category, not product name)
   - sku:              sku.id  (same as store_product_id)
   - price:            sku.priceInfoDto.salePrice
-  - available:        sku.availability == "Άμεσα Διαθέσιμο" (or similar in-stock text)
+  - available:        sku.availability text in the in-stock set (IN_STOCK_TEXTS),
+                      OR marketplace offerCount > 0
   - image_url:        sku.media.heroImage.large
   - product_url:      constructed from sku.url
   - ean:              from topSpecs where displayName == "EAN"
@@ -45,6 +46,7 @@ import os
 import re
 import time
 import xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -134,10 +136,28 @@ DEFAULT_HEADERS = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-# Greek text values that indicate the product is in stock.
-# Used as a fallback when the numeric offerCount field is missing.
-# Normalized to lowercase for safer comparison.
-IN_STOCK_TEXTS = {"άμεσα διαθέσιμο", "διαθέσιμο"}
+# Lowercased Greek availability texts that count as in stock, i.e. the
+# product can be ordered at the shown price right now.  Compared after
+# .strip().lower() against sku.availability.
+#
+# "προσωρινά εξαντλημένο" (temporarily out of stock) is intentionally
+# excluded, and any unknown or missing text maps to unavailable by
+# design — a fail-safe so that new wordings never silently mark
+# products as in stock.  The per-run availability text distribution
+# logged in the final summary surfaces such new values.
+IN_STOCK_TEXTS = {
+    "άμεσα διαθέσιμο",            # immediately available
+    "διαθέσιμο",                  # available
+    "κατόπιν παραγγελίας",        # by order
+    "διαθέσιμο με παραγγελία",    # available with order
+}
+
+# Per-run distribution of the verbatim availability text seen in API
+# responses.  Populated by parse_api_response for every parsed product
+# and logged in the final run summary, so new or shifted availability
+# wordings are visible in nightly logs.  "<missing>" is recorded when
+# the field is absent from the payload.
+AVAILABILITY_TEXT_COUNTS: Counter[str] = Counter()
 
 
 # ── Pydantic model ────────────────────────────────────────────────────────
@@ -387,15 +407,40 @@ def parse_api_response(data: dict, product_id: str) -> VariantRow | None:
     sale_price = price_info.get("salePrice")
     price = Decimal(str(sale_price)) if sale_price and sale_price > 0 else None
 
-    # Availability: prefer the numeric offerCount field (locale-independent).
-    # offerCount > 0 means the product has purchasable offers.
-    # Fall back to Greek availability text only if offerCount is missing.
+    # Availability: combined predicate from two independent signals.
+    #
+    # sku.offerCount counts marketplace (Mirakl) offers and is 0 for
+    # regular first-party stock, so it must not gate the decision on
+    # its own (treating it as primary marked the entire catalog as
+    # unavailable).  The Greek availability text is the primary
+    # in-stock signal; offerCount > 0 is kept as a secondary OR-signal
+    # in case marketplace offers ever appear.
+    raw_availability = sku.get("availability")
+
+    # Record the verbatim text (before any normalisation) for the
+    # per-run distribution logged in the final summary.
+    AVAILABILITY_TEXT_COUNTS[
+        raw_availability if raw_availability is not None else "<missing>"
+    ] += 1
+
+    # Secondary signal: a real numeric offerCount greater than zero.
+    # bool is excluded (it subclasses int); missing or non-numeric
+    # values count as 0 rather than raising.
     offer_count = sku.get("offerCount")
-    if offer_count is not None:
-        available = int(offer_count) > 0
-    else:
-        availability_text = sku.get("availability", "").strip().lower()
-        available = availability_text in IN_STOCK_TEXTS
+    offer_available = (
+        isinstance(offer_count, (int, float))
+        and not isinstance(offer_count, bool)
+        and offer_count > 0
+    )
+
+    # Primary signal: normalised availability text in the in-stock set.
+    # None, unknown, or missing texts evaluate to False (fail-safe).
+    text_available = (
+        isinstance(raw_availability, str)
+        and raw_availability.strip().lower() in IN_STOCK_TEXTS
+    )
+
+    available = offer_available or text_available
 
     # Image URL from media.heroImage
     media = sku.get("media", {})
@@ -890,6 +935,16 @@ async def async_main(limit: int | None = None) -> None:
             r.title[:50], r.price, r.sku, r.mpn, r.ean,
             r.product_type, r.available,
         )
+
+    # 8. Availability text distribution — one line per distinct verbatim
+    # value, sorted by count descending.  Surfaces new or shifted
+    # wordings in nightly logs so IN_STOCK_TEXTS can be kept current.
+    log.info("Availability text distribution:")
+    if AVAILABILITY_TEXT_COUNTS:
+        for text, count in AVAILABILITY_TEXT_COUNTS.most_common():
+            log.info("  %r: %d", text, count)
+    else:
+        log.info("  (no products parsed)")
 
     log.info("=== Done ===")
 
