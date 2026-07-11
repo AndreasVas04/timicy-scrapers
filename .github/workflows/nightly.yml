@@ -16,7 +16,7 @@ on:
   schedule:
     # Minute 23 avoids GitHub's congested on-the-hour cron slots, which
     # suffer from queuing delays and occasional skips under load.
-    - cron: "23 0 * * *"
+    - cron: "23 21 * * *"
   # Allow supervised manual runs from the Actions tab.
   workflow_dispatch: {}
 
