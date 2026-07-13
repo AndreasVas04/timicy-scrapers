@@ -48,6 +48,9 @@ PRODUCTS_ENDPOINT = f"{BASE_URL}/api/ext/getProductsByCategory"
 PAGE_SIZE = 100                             # Products per API page (max observed working)
 REQUEST_DELAY = 1.0                         # Seconds between API requests (polite crawling)
 MAX_RETRIES = 3                             # Retry attempts on 429 / 5xx responses
+MAX_PAGES_PER_CATEGORY = 50                 # Safety cap per category (50 × 100 = 5000 products)
+                                            # protects against a pathological API that never
+                                            # reports the record set as complete
 
 # AEM CMS endpoint that serves the full navigation/category tree as JSON.
 # Discovered by inspecting the Next.js _app bundle: the site loads this
@@ -310,7 +313,11 @@ def fetch_products_for_category(
 
         products = data.get("catalogEntryView", [])
         total = data.get("recordSetTotal", 0)
-        complete = data.get("recordSetComplete", True)
+        # The API returns recordSetComplete as a JSON STRING ("true" /
+        # "false"), not a boolean.  A plain truthiness check would treat
+        # the non-empty string "false" as complete and stop after page 1,
+        # so the flag must be parsed with an explicit string comparison.
+        complete = str(data.get("recordSetComplete", "true")).lower() == "true"
 
         if not products:
             # Empty response — either the category has no products,
@@ -324,12 +331,32 @@ def fetch_products_for_category(
         if page == 1:
             log.info("  [%s] %d total products, fetching…", category_title, total)
 
-        # Check if we've collected all products
+        # Check if we've collected all products.  The count-based guard
+        # is a backstop in case the API misreports the complete flag.
         if complete or len(all_products) >= total:
+            break
+
+        # Safety cap: never fetch more than MAX_PAGES_PER_CATEGORY pages
+        # for one category, in case the API keeps reporting an incomplete
+        # record set forever (pathological pagination loop).
+        if page >= MAX_PAGES_PER_CATEGORY:
+            log.warning(
+                "  [%s] Page cap (%d) reached with %d/%d products — stopping.",
+                category_title, MAX_PAGES_PER_CATEGORY, len(all_products), total,
+            )
             break
 
         page += 1
         time.sleep(REQUEST_DELAY)  # Polite delay between pages
+
+    # Permanent truncation observability: if the category yielded fewer
+    # products than the API's own total, say so loudly in the nightly
+    # logs so a pagination regression cannot go unnoticed again.
+    if len(all_products) < total:
+        log.warning(
+            "  [%s] Truncated: fetched %d of %d products.",
+            category_title, len(all_products), total,
+        )
 
     return all_products
 
