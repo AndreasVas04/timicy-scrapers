@@ -18,15 +18,18 @@ Strategy:
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
 import re
 import time
+from collections import Counter
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, Field
@@ -50,6 +53,27 @@ MAX_RETRIES = 3                             # Retry attempts on 429 / 5xx respon
 # Discovered by inspecting the Next.js _app bundle: the site loads this
 # on every page to render the mega-menu.
 NAV_MENU_URL = "https://new-content.kotsovolos.cy/content/kotsovolos/b2c/cy/home.navMenu.json"
+
+# PDP availability enrichment (phase 2 of availability detection).
+# The listing API's OrderableFlagCY attribute reports "false" for many
+# products that the product page itself sells as available — the flag
+# tracks Greek-warehouse orderability, not what the Cyprus site actually
+# offers shoppers.  For listing-level "unavailable" products in mapped
+# categories we therefore fetch the Next.js data-route JSON behind the
+# product page and read its server-rendered availabilityData block, which
+# is the exact availability badge shown on the site.
+ENRICHMENT_MAX_FETCHES = 3500       # Hard cap on PDP fetches per run (safety valve)
+ENRICHMENT_MIN_INTERVAL = 0.4       # Min seconds between PDP fetches (~2.5 req/s)
+ENRICHMENT_403_COOLDOWN = 45.0      # Seconds to pause when Akamai answers 403
+
+# Same mapping file ingest.py loads; used to skip PDP fetches for products
+# whose category is unmapped (those rows never survive the ingest step).
+CATEGORY_MAPPING_CSV = Path("category_mapping.csv")
+
+# availabilityData.availableStatusKey values that mean the product can be
+# bought (immediately, as last pieces, or on back-order).  NOT_AVAILABLE
+# and any unknown or missing status map to not-available (fail-safe).
+AVAILABLE_STATUS_KEYS = {"IMMEDIATELY_AVAILABLE", "LAST_PIECES", "ON_ORDER"}
 
 # Matches Apple-style part numbers like "MH344TY/A" or "MQDT3ZM/A".
 # Captures the region-independent root (e.g. "MH344") before the
@@ -410,41 +434,124 @@ def build_image_fallback(part_number: str) -> str:
     return f"https://assets.kotsovolos.gr/product/{part_number}-b.jpg"
 
 
+def _parse_positive_decimal(value: Any) -> Decimal | None:
+    """Parse a raw price value, accepting it only if it is a number > 0.
+
+    The API mixes floats, numeric strings and missing keys across its
+    price fields, and stale entries are often 0.0.  Anything that is not
+    a strictly positive number returns None so the caller can fall
+    through to the next price source.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _extract_offer_value(price_list: Any) -> Decimal | None:
+    """Return the 'Offer' entry's value from a Kotsovolos price list.
+
+    Price data comes as a list of usage-tagged dicts, e.g.
+    [{"usage": "Display", "value": "1299.0"}, {"usage": "Offer", "value": "1269.0"}].
+    'Display' is the crossed-out list price; 'Offer' is what the site
+    actually charges.  Returns the Offer value only when it is present,
+    parseable and greater than zero — otherwise None so the caller can
+    fall through to the next source.
+    """
+    if not isinstance(price_list, list):
+        return None
+    for entry in price_list:
+        if isinstance(entry, dict) and entry.get("usage") == "Offer":
+            return _parse_positive_decimal(entry.get("value"))
+    return None
+
+
+def _select_price(product: dict[str, Any]) -> tuple[Decimal | None, str]:
+    """Select the selling price for a product, preferring 'Offer' entries.
+
+    The listing API exposes three price sources that can disagree:
+      1. product["price"]            — product-level Display/Offer list
+      2. product["sKUs"][0]["price"] — SKU-level Display/Offer list
+      3. product["price_EUR"]        — flat field, stale for a large
+                                       slice of the catalog (sometimes 0.0)
+    The website renders the Offer value, so it is preferred (product
+    level first, then the first SKU) and price_EUR is used only when
+    neither Offer entry is usable.  Returns (price, source_tag) where
+    source_tag is one of "offer_product", "offer_sku",
+    "price_eur_fallback" or "none" for observability counting.
+    """
+    price = _extract_offer_value(product.get("price"))
+    if price is not None:
+        return price, "offer_product"
+
+    # Some products (e.g. ones whose product-level Offer entry has no
+    # "value" key) only carry a usable Offer price on their first SKU.
+    skus = product.get("sKUs")
+    if isinstance(skus, list) and skus and isinstance(skus[0], dict):
+        price = _extract_offer_value(skus[0].get("price"))
+        if price is not None:
+            return price, "offer_sku"
+
+    # Last resort: the flat field the scraper historically used.
+    price = _parse_positive_decimal(product.get("price_EUR"))
+    if price is not None:
+        return price, "price_eur_fallback"
+
+    return None, "none"
+
+
 def normalize(
     products_with_categories: list[tuple[dict[str, Any], str]],
-) -> list[VariantRow]:
+) -> tuple[list[VariantRow], set[str]]:
     """Convert raw API product dicts into normalised VariantRow objects.
 
     Each Kotsovolos product maps to exactly one row (unlike Shopify stores
     where a product may have multiple variants).  Variants in Kotsovolos
     (e.g. different colours/storage) are separate products with distinct
     partNumbers.
+
+    Returns (rows, enrichment_candidates): the normalised rows plus the
+    set of partNumbers whose OrderableFlagCY attribute was "false".
+    Those rows carry the phase-1 value available=False and are the
+    candidates for the phase-2 PDP re-check in enrich_availability().
     """
     rows: list[VariantRow] = []
+    # Distribution of which price source produced each row's price,
+    # logged once per run for observability.
+    price_sources: Counter[str] = Counter()
+    # partNumbers flagged OrderableFlagCY="false" — phase-2 candidates.
+    enrichment_candidates: set[str] = set()
 
     for product, category_title in products_with_categories:
         part_number = product.get("partNumber", "")
         name = product.get("name", "")
         manufacturer = product.get("manufacturer") or None
 
-        # Price: the API provides price_EUR as a float string for the current price.
-        # The 'price' field is a list with Display/Offer entries, but price_EUR
-        # is the simpler, more reliable source.
-        price_str = product.get("price_EUR")
-        price = Decimal(str(price_str)) if price_str is not None else None
+        # Price: prefer the rendered 'Offer' entry (product level, then
+        # first SKU) over the flat price_EUR field, which is stale for a
+        # large slice of the catalog.  _select_price documents the exact
+        # fallback order and returns a source tag for observability.
+        price, price_source = _select_price(product)
+        price_sources[price_source] += 1
 
-        # Availability: a product is "available" only if it's marked as
-        # buyable AND the Cyprus-specific OrderableFlagCY attribute is
-        # not explicitly "false".  Many products have buyable=true but
-        # OrderableFlagCY=false — these are listed on the site but
-        # cannot actually be ordered in Cyprus (they may only be
-        # available via the Greek warehouse or in Greek stores).
+        # Availability phase 1 (listing-level): a product is "available"
+        # only if it's marked as buyable AND the Cyprus-specific
+        # OrderableFlagCY attribute is not explicitly "false".  Many
+        # products have buyable=true but OrderableFlagCY=false — the flag
+        # tracks Greek-warehouse orderability and often disagrees with
+        # what the Cyprus product page actually sells.
         buyable = product.get("buyable", "false") == "true"
         orderable_cy = _get_attribute(product, "OrderableFlagCY")
-        # If the flag is present and explicitly "false", the product
-        # is not orderable in Cyprus regardless of the buyable flag.
+        # If the flag is present and explicitly "false", keep the
+        # conservative phase-1 value (not available) but remember the
+        # partNumber: phase 2 re-checks these against the product page
+        # and flips the ones the site really sells.
         if orderable_cy is not None and orderable_cy.lower() == "false":
             buyable = False
+            enrichment_candidates.add(part_number)
 
         # Image: use the thumbnail URL from the product listing
         thumbnail = product.get("thumbnail") or None
@@ -487,7 +594,388 @@ def normalize(
             identifier_source=identifier_source,
         ))
 
-    return rows
+    # One-line distribution of price sources so nightly logs show how
+    # often each fallback level was used (a sudden shift here signals an
+    # API format change).
+    log.info(
+        "Price field sources: offer_product=%d, offer_sku=%d, price_eur_fallback=%d, none=%d",
+        price_sources["offer_product"],
+        price_sources["offer_sku"],
+        price_sources["price_eur_fallback"],
+        price_sources["none"],
+    )
+
+    return rows, enrichment_candidates
+
+
+# ── PDP availability enrichment (phase 2) ─────────────────────
+
+
+def _load_mapped_product_types() -> set[str]:
+    """Return the kotsovolos raw product types that ingest.py will keep.
+
+    Replicates the loading rule of ingest.py's category-mapping step:
+    rows in category_mapping.csv whose canonical_category is blank are
+    dropped during ingest, so spending PDP fetches on their products
+    would be wasted budget.  Only mapped kotsovolos product types are
+    returned.
+
+    A missing CSV yields an empty set, which simply disables enrichment
+    for the run (fail-safe: rows keep their phase-1 availability).
+    """
+    if not CATEGORY_MAPPING_CSV.exists():
+        log.warning(
+            "%s not found — skipping availability enrichment.", CATEGORY_MAPPING_CSV
+        )
+        return set()
+
+    mapped: set[str] = set()
+    with open(CATEGORY_MAPPING_CSV, encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            store = (row.get("store") or "").strip()
+            raw_pt = (row.get("raw_product_type") or "").strip()
+            canon = (row.get("canonical_category") or "").strip()
+            # Rows with a blank canonical_category are intentionally
+            # excluded, exactly as ingest.py excludes them.
+            if store == "kotsovolos" and raw_pt and canon:
+                mapped.add(raw_pt)
+    return mapped
+
+
+class _MinIntervalLimiter:
+    """Wall-clock pacer enforcing a minimum interval between requests.
+
+    Synchronous counterpart of public_scraper.py's asyncio RateLimiter:
+    each wait() call sleeps until its time slot opens, then advances the
+    slot by the configured interval, so PDP fetches never exceed the
+    target rate no matter how fast responses come back.
+    """
+
+    def __init__(self, min_interval: float) -> None:
+        self._interval = min_interval   # minimum seconds between request starts
+        self._next_allowed = 0.0        # monotonic timestamp of the next open slot
+
+    def wait(self) -> None:
+        """Sleep until the next slot opens, then claim it."""
+        now = time.monotonic()
+        if now < self._next_allowed:
+            time.sleep(self._next_allowed - now)
+            now = time.monotonic()
+        self._next_allowed = max(now, self._next_allowed) + self._interval
+
+
+class AvailabilityEnricher:
+    """Fetches per-product availability from the Next.js data route.
+
+    The product page is server-side rendered and its pageProps carry an
+    availabilityData block holding the availability badge shown to
+    shoppers.  The same JSON is served without the surrounding HTML from
+        {BASE_URL}/_next/data/{buildId}/{slug}.json
+    where buildId identifies the current frontend deployment and slug is
+    the product URL path.  This class:
+      * discovers buildId once from the homepage's __NEXT_DATA__ script,
+      * fetches the data-route JSON for each requested product,
+      * refreshes buildId once per run if the route starts returning 404
+        (which happens when the site deploys mid-run),
+      * falls back to parsing the full PDP HTML when the refreshed route
+        still 404s for a product,
+      * treats every failure as "not available" (fail-safe: a network
+        problem must never mark an unavailable product as in stock).
+
+    Requests go through the same httpx.Client as the listing scrape, so
+    they carry the identical browser-header fingerprint and connection
+    settings that already pass Akamai.
+    """
+
+    def __init__(self, client: httpx.Client) -> None:
+        self._client = client
+        self._limiter = _MinIntervalLimiter(ENRICHMENT_MIN_INTERVAL)
+        self._build_id: str | None = None     # current Next.js deployment id
+        self._build_id_refreshed = False      # buildId re-fetch allowed once per run
+        self.status_counter: Counter[str] = Counter()  # availableStatusKey distribution
+        self.cta_counter: Counter[str] = Counter()     # ctaNameTextKey distribution
+        self.fetch_count = 0                  # PDP HTTP requests made (cap enforcement)
+
+    # -- buildId discovery -------------------------------------------
+
+    @staticmethod
+    def _extract_next_data(html: str) -> dict[str, Any] | None:
+        """Parse the __NEXT_DATA__ JSON blob embedded in a Next.js page.
+
+        Locates the <script id="__NEXT_DATA__"> tag and scans forward
+        with a string-aware balanced-brace counter to find the end of the
+        JSON object; the blob contains nested braces and quoted strings,
+        so a naive regex or find("</script>") is not reliable.
+        """
+        marker = html.find('id="__NEXT_DATA__"')
+        if marker == -1:
+            return None
+        start = html.find("{", marker)
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start, len(html)):
+            ch = html[i]
+            if in_string:
+                # Inside a JSON string: only an unescaped quote ends it.
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    # Found the matching closing brace of the blob.
+                    try:
+                        return json.loads(html[start : i + 1])
+                    except json.JSONDecodeError:
+                        return None
+        return None
+
+    def _fetch_build_id(self) -> str | None:
+        """Fetch the homepage and extract the current Next.js buildId.
+
+        Tries the structured __NEXT_DATA__ parse first, then falls back
+        to a plain regex on the "buildId" key in case the balanced-brace
+        scan fails (e.g. unexpected markup changes).  Returns None on any
+        failure — the caller decides whether to skip enrichment.
+        """
+        try:
+            self._limiter.wait()
+            resp = self._client.get(BASE_URL)
+        except httpx.HTTPError as exc:
+            log.warning("Homepage fetch for buildId failed: %s", exc)
+            return None
+        if resp.status_code != 200:
+            log.warning("Homepage fetch for buildId returned HTTP %d.", resp.status_code)
+            return None
+
+        html = resp.text
+        data = self._extract_next_data(html)
+        if isinstance(data, dict):
+            build_id = data.get("buildId")
+            if isinstance(build_id, str) and build_id:
+                return build_id
+
+        # Regex fallback: the buildId also appears as a plain JSON key
+        # inside the same script tag.
+        m = re.search(r'"buildId"\s*:\s*"([^"]+)"', html)
+        if m:
+            return m.group(1)
+
+        log.warning("Could not extract buildId from homepage HTML.")
+        return None
+
+    def ensure_build_id(self) -> bool:
+        """Discover the buildId if not yet known.
+
+        Returns False when discovery fails, in which case the caller must
+        skip enrichment for this run (the data route cannot be built).
+        """
+        if self._build_id is None:
+            self._build_id = self._fetch_build_id()
+        return self._build_id is not None
+
+    # -- per-product fetch -------------------------------------------
+
+    def _data_route_url(self, slug: str) -> str:
+        """Build the Next.js data-route URL for a product page slug."""
+        return f"{BASE_URL}/_next/data/{self._build_id}/{slug}.json"
+
+    def _get_pdp(self, url: str) -> httpx.Response:
+        """Rate-limited GET with the Next.js data-route header additions.
+
+        Sends the client's default browser headers plus the two headers
+        the site's own frontend uses for data-route XHRs.  Every call
+        counts against the per-run fetch cap.
+        """
+        self._limiter.wait()
+        self.fetch_count += 1
+        return self._client.get(
+            url,
+            headers={"Accept": "application/json", "x-nextjs-data": "1"},
+        )
+
+    def _get_pdp_with_403_cooldown(self, url: str) -> httpx.Response | None:
+        """GET a PDP URL, pausing once on an Akamai 403 before retrying.
+
+        Akamai signals rate exhaustion with 403 rather than 429; a fixed
+        cooldown lets its token bucket refill.  A second consecutive 403
+        is returned to the caller, which records the product as failed.
+        Network-level errors return None (also recorded as failed).
+        """
+        try:
+            resp = self._get_pdp(url)
+            if resp.status_code == 403:
+                log.warning(
+                    "HTTP 403 from %s — cooling down for %.0fs.",
+                    url, ENRICHMENT_403_COOLDOWN,
+                )
+                time.sleep(ENRICHMENT_403_COOLDOWN)
+                resp = self._get_pdp(url)
+            return resp
+        except httpx.HTTPError as exc:
+            log.warning("PDP fetch error for %s: %s", url, exc)
+            return None
+
+    def _classify(self, availability: Any) -> bool:
+        """Map an availabilityData block to a boolean and count keys.
+
+        IMMEDIATELY_AVAILABLE / LAST_PIECES / ON_ORDER → purchasable.
+        NOT_AVAILABLE, unknown keys and missing data → not purchasable
+        (fail-safe).  Unknown keys are counted verbatim so brand-new
+        statuses show up in the nightly logs instead of silently mapping
+        to False forever.
+        """
+        if not isinstance(availability, dict):
+            self.status_counter["<missing availabilityData>"] += 1
+            self.cta_counter["<missing availabilityData>"] += 1
+            return False
+        status_key = availability.get("availableStatusKey")
+        cta_key = availability.get("ctaNameTextKey")
+        self.status_counter[str(status_key)] += 1
+        self.cta_counter[str(cta_key)] += 1
+        return status_key in AVAILABLE_STATUS_KEYS
+
+    def check_available(self, product_url: str) -> tuple[bool, bool]:
+        """Return (available, fetch_succeeded) for one product page.
+
+        Fetch order:
+          1. /_next/data/{buildId}/{slug}.json — small JSON payload.
+          2. On 404: refresh the buildId once per run (a data-route 404
+             usually means the frontend deployed mid-run) and retry.
+          3. On persistent 404: fall back to the full PDP HTML and parse
+             its embedded __NEXT_DATA__ blob, which carries the same
+             pageProps.
+        Any unrecoverable failure returns (False, False): the row keeps
+        its phase-1 "not available" value and the failure is counted by
+        the caller.
+        """
+        # The slug is the product URL path without the leading slash,
+        # e.g. "mobile-phones-gps/smartphones/306232-smartphone-...".
+        slug = urlparse(product_url).path.lstrip("/")
+
+        resp = self._get_pdp_with_403_cooldown(self._data_route_url(slug))
+
+        if resp is not None and resp.status_code == 404 and not self._build_id_refreshed:
+            # First 404 of the run: assume the deployment changed and the
+            # old buildId went stale.  Refresh it once and retry.
+            self._build_id_refreshed = True
+            new_build_id = self._fetch_build_id()
+            if new_build_id:
+                log.info("Data route 404 — refreshed buildId and retrying.")
+                self._build_id = new_build_id
+                resp = self._get_pdp_with_403_cooldown(self._data_route_url(slug))
+
+        if resp is not None and resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except (json.JSONDecodeError, ValueError):
+                payload = None
+            if isinstance(payload, dict):
+                page_props = payload.get("pageProps")
+                if isinstance(page_props, dict):
+                    return self._classify(page_props.get("availabilityData")), True
+            # Non-JSON or unexpectedly-shaped 200 body: fail-safe below.
+
+        if resp is not None and resp.status_code == 404:
+            # The data route still 404s after the buildId refresh — fetch
+            # the full product page and read the same data from its
+            # embedded __NEXT_DATA__ script.
+            resp = self._get_pdp_with_403_cooldown(product_url)
+            if resp is not None and resp.status_code == 200:
+                data = self._extract_next_data(resp.text)
+                if isinstance(data, dict):
+                    props = data.get("props")
+                    if isinstance(props, dict):
+                        page_props = props.get("pageProps")
+                        if isinstance(page_props, dict):
+                            return self._classify(page_props.get("availabilityData")), True
+
+        # Every remaining path (network error, HTTP error status, broken
+        # payload) lands here: report a failed fetch, keep available=False.
+        return False, False
+
+
+def enrich_availability(
+    client: httpx.Client,
+    rows: list[VariantRow],
+    candidate_ids: set[str],
+) -> None:
+    """Phase 2 of availability detection: PDP re-check for flagged rows.
+
+    The listing API marks many Cyprus-sellable products with
+    OrderableFlagCY="false" even though the product page sells them (the
+    flag tracks Greek-warehouse orderability).  For every phase-1
+    candidate whose category is mapped in category_mapping.csv (i.e.
+    whose rows survive ingest), fetch the product page's server-rendered
+    availabilityData and flip the row to available=True when the page
+    shows a purchasable badge.
+
+    Rows are mutated in place.  All failure modes leave available=False.
+    """
+    candidates = [r for r in rows if r.store_product_id in candidate_ids]
+
+    # Products in unmapped categories never reach the matching pipeline,
+    # so fetching their PDPs would waste the request budget.  They keep
+    # their conservative phase-1 value without a fetch.
+    mapped_types = _load_mapped_product_types()
+    to_fetch = [r for r in candidates if r.product_type in mapped_types]
+    skipped_unmapped = len(candidates) - len(to_fetch)
+
+    enricher = AvailabilityEnricher(client)
+    fetched = flipped_true = confirmed_false = failed = overflow = 0
+
+    if to_fetch and not enricher.ensure_build_id():
+        # Without a buildId the data route cannot be constructed.  Skip
+        # enrichment entirely for this run rather than crashing the
+        # scrape; every candidate keeps its phase-1 availability.
+        log.warning("buildId discovery failed — skipping availability enrichment this run.")
+        to_fetch = []
+
+    for row in to_fetch:
+        if enricher.fetch_count >= ENRICHMENT_MAX_FETCHES:
+            # Cap reached: remaining candidates stay at their phase-1
+            # value (False) and are counted below.
+            overflow += 1
+            continue
+        fetched += 1
+        available, ok = enricher.check_available(row.product_url)
+        if not ok:
+            failed += 1
+        elif available:
+            row.available = True
+            flipped_true += 1
+        else:
+            confirmed_false += 1
+
+    if overflow:
+        log.warning(
+            "Enrichment fetch cap (%d) reached — %d candidate(s) left at phase-1 value.",
+            ENRICHMENT_MAX_FETCHES, overflow,
+        )
+
+    # Observability block: always printed so nightly logs expose the
+    # availability pipeline's behaviour even on runs where nothing
+    # changed.  Distributions are plain dicts of verbatim keys.
+    log.info(
+        "Kotsovolos availability status distribution: %s", dict(enricher.status_counter)
+    )
+    log.info("Kotsovolos cta distribution: %s", dict(enricher.cta_counter))
+    log.info(
+        "Kotsovolos enrichment: candidates=%d, skipped_unmapped=%d, fetched=%d, "
+        "flipped_true=%d, confirmed_false=%d, failed=%d",
+        len(candidates), skipped_unmapped, fetched, flipped_true, confirmed_false, failed,
+    )
 
 
 # ── Supabase upsert ────────────────────────────────────────────
@@ -575,11 +1063,18 @@ def main() -> None:
         products_with_cats = fetch_all_products(client, categories)
         log.info("Total unique products fetched: %d", len(products_with_cats))
 
-    # 3. Normalize into VariantRow objects
-    rows = normalize(products_with_cats)
-    log.info("Total rows after normalization: %d", len(rows))
+        # 3. Normalize into VariantRow objects (phase-1 availability from
+        #    the listing API; also collects the phase-2 candidate set)
+        rows, candidate_ids = normalize(products_with_cats)
+        log.info("Total rows after normalization: %d", len(rows))
 
-    # 4. Log MPN/EAN extraction stats for sanity-checking
+        # 4. Phase-2 availability: PDP re-check for listing-level
+        #    "unavailable" products in mapped categories.  Runs inside the
+        #    client block so the requests reuse the same connection pool
+        #    and browser-header fingerprint as the listing scrape.
+        enrich_availability(client, rows, candidate_ids)
+
+    # 5. Log MPN/EAN extraction stats for sanity-checking
     mpn_present = sum(1 for r in rows if r.mpn is not None)
     mpn_missing = sum(1 for r in rows if r.mpn is None)
     # "Apple PN" = MPNs where mpn_root differs from mpn (region suffix stripped)
@@ -597,7 +1092,7 @@ def main() -> None:
             ean_count += 1
     log.info("Products with EAN (BarCode): %d / %d", ean_count, len(products_with_cats))
 
-    # 5. Dump all rows to a local JSON file (useful for debugging / offline analysis)
+    # 6. Dump all rows to a local JSON file (useful for debugging / offline analysis)
     out_path = Path("data/kotsovolos.json")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     serializable = []
@@ -611,10 +1106,10 @@ def main() -> None:
     )
     log.info("Wrote %d rows to %s", len(serializable), out_path)
 
-    # 6. Upsert to Supabase (no-op if credentials aren't configured)
+    # 7. Upsert to Supabase (no-op if credentials aren't configured)
     upsert_to_supabase(rows)
 
-    # 7. Print sample rows for quick visual verification
+    # 8. Print sample rows for quick visual verification
     log.info("=== Sample rows ===")
     for r in rows[:5]:
         log.info(
