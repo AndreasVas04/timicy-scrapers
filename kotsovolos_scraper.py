@@ -22,6 +22,7 @@ import csv
 import json
 import logging
 import os
+import random
 import re
 import time
 from collections import Counter
@@ -46,7 +47,11 @@ BASE_URL = "https://www.kotsovolos.cy"
 STORE_ID = "10161"                          # Cyprus store identifier
 PRODUCTS_ENDPOINT = f"{BASE_URL}/api/ext/getProductsByCategory"
 PAGE_SIZE = 100                             # Products per API page (max observed working)
-REQUEST_DELAY = 1.0                         # Seconds between API requests (polite crawling)
+REQUEST_DELAY_MIN = 1.5                      # Minimum seconds between listing API requests
+REQUEST_DELAY_MAX = 2.5                      # Maximum seconds — jitter breaks fixed-interval fingerprint
+LISTING_BLOCK_COOLDOWN = 60.0                # Seconds to pause after detecting an Akamai block
+LISTING_BLOCK_RETRIES = 2                    # Retries of the same page after a block cooldown
+LISTING_BLOCK_CIRCUIT = 5                    # Consecutive blocked categories before aborting listing phase
 MAX_RETRIES = 3                             # Retry attempts on 429 / 5xx responses
 MAX_PAGES_PER_CATEGORY = 50                 # Safety cap per category (50 × 100 = 5000 products)
                                             # protects against a pathological API that never
@@ -224,6 +229,90 @@ def _request_with_retry(
     return resp  # unreachable but keeps type checker happy
 
 
+# ── Listing-phase helpers ─────────────────────────────────────
+
+
+def _polite_pause() -> None:
+    """Sleep for a randomised interval between REQUEST_DELAY_MIN and REQUEST_DELAY_MAX.
+
+    The jitter breaks the fixed-interval request fingerprint that Akamai
+    uses for bot detection, and roughly halves the sustained request rate
+    compared to the old fixed 1.0 s delay.
+    """
+    time.sleep(random.uniform(REQUEST_DELAY_MIN, REQUEST_DELAY_MAX))
+
+
+class ListingBlockedError(Exception):
+    """Raised when a listing API response is identified as an Akamai block.
+
+    Akamai bot-protection can redirect listing requests to an HTML error
+    page.  Because the httpx client follows redirects, the block arrives
+    as HTTP 200 with an HTML body instead of the expected JSON.  This
+    exception signals that condition so callers can retry after a cooldown.
+    """
+
+
+# Simple counters tracking Akamai block events during the listing phase.
+# Logged at the end of fetch_all_products for nightly observability.
+listing_block_stats: dict[str, int] = {
+    "blocks_detected": 0,
+    "retries_recovered": 0,
+    "categories_skipped": 0,
+    "listing_requests_total": 0,
+}
+
+
+def _fetch_listing_page(
+    client: httpx.Client,
+    params: dict[str, str],
+) -> dict[str, Any]:
+    """Fetch one page from the product-listing API, guarding against Akamai blocks.
+
+    Increments listing_requests_total on every call (counts page-fetch
+    attempts).  Raises ListingBlockedError when the response looks like
+    an Akamai bot-protection redirect rather than valid API JSON.
+
+    Why status-code checking alone is insufficient: the httpx client is
+    created with follow_redirects=True, so Akamai's 302 redirect to an
+    HTML error page is silently followed and arrives here as HTTP 200
+    with an HTML body.  We therefore inspect the redirect history, the
+    final URL, and the JSON-parseability of the body to detect blocks.
+    """
+    listing_block_stats["listing_requests_total"] += 1
+    resp = _request_with_retry(client, PRODUCTS_ENDPOINT, params)
+
+    # Block detection (a): the response chain contains a redirect whose
+    # final URL points to an Akamai error page.  This catches the exact
+    # 302 → assets.kotsovolos.gr/vp/error-pages/… pattern seen in prod.
+    if resp.history:
+        final_host = resp.url.host
+        final_path = str(resp.url.path)
+        if final_host == "assets.kotsovolos.gr" or "/vp/error-pages/" in final_path:
+            listing_block_stats["blocks_detected"] += 1
+            raise ListingBlockedError(
+                f"Redirect to Akamai block page: {resp.url}"
+            )
+
+    # Block detection (b) + (c): the body is not valid JSON, or parses
+    # to something other than a dict (e.g. an HTML error page that
+    # slipped through without a redirect, or a JSON array).
+    try:
+        data = resp.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        listing_block_stats["blocks_detected"] += 1
+        raise ListingBlockedError(
+            f"Response is not valid JSON (likely HTML block page): {exc}"
+        ) from exc
+
+    if not isinstance(data, dict):
+        listing_block_stats["blocks_detected"] += 1
+        raise ListingBlockedError(
+            f"Parsed JSON is {type(data).__name__}, expected dict — probable block page"
+        )
+
+    return data
+
+
 # ── Category discovery ─────────────────────────────────────────
 
 def fetch_category_tree(client: httpx.Client) -> list[dict[str, Any]]:
@@ -286,7 +375,7 @@ def fetch_products_for_category(
     client: httpx.Client,
     category_id: str,
     category_title: str,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     """Paginate through all products in a single category.
 
     The Kotsovolos API uses an unusual pagination style: the page number
@@ -294,10 +383,15 @@ def fetch_products_for_category(
     as a URL-encoded query string (e.g. "pageNumber=2&pageSize=100").
     This was discovered by inspecting the minified Next.js app bundle.
 
-    Returns a list of raw product dicts from the API's catalogEntryView.
+    Returns a tuple of:
+      - list of raw product dicts from the API's catalogEntryView
+      - blocked: True if pagination was aborted due to a persistent
+        Akamai block (all retries for a page exhausted).  Partial results
+        collected before the block are still returned.
     """
     all_products: list[dict[str, Any]] = []
     page = 1
+    total = 0  # will be set from the first successful API response
 
     while True:
         # Build the pagination string that goes inside the 'params' query param.
@@ -308,8 +402,37 @@ def fetch_products_for_category(
             "params": f"pageNumber={page}&pageSize={PAGE_SIZE}",
         }
 
-        resp = _request_with_retry(client, PRODUCTS_ENDPOINT, params)
-        data = resp.json()
+        # Attempt to fetch this page, retrying after cooldown if Akamai blocks.
+        data: dict[str, Any] | None = None
+        for retry in range(LISTING_BLOCK_RETRIES + 1):
+            try:
+                data = _fetch_listing_page(client, params)
+                break  # success — exit retry loop
+            except ListingBlockedError:
+                if retry < LISTING_BLOCK_RETRIES:
+                    # Recoverable: log the block, wait for cooldown, then retry
+                    # the SAME page (not the next one).
+                    log.warning(
+                        "  [%s] Akamai block on page %d (attempt %d/%d) — "
+                        "cooling down %.0fs before retry.",
+                        category_title, page, retry + 1,
+                        LISTING_BLOCK_RETRIES + 1, LISTING_BLOCK_COOLDOWN,
+                    )
+                    time.sleep(LISTING_BLOCK_COOLDOWN)
+                else:
+                    # All retries exhausted — persistent block.  Return
+                    # whatever we collected so far (partial results).
+                    log.warning(
+                        "  [%s] Persistent Akamai block on page %d after %d retries — "
+                        "returning %d partial products.",
+                        category_title, page, LISTING_BLOCK_RETRIES,
+                        len(all_products),
+                    )
+                    return all_products, True  # blocked=True
+
+        # If a retry succeeded, record the recovery
+        if retry > 0 and data is not None:
+            listing_block_stats["retries_recovered"] += 1
 
         products = data.get("catalogEntryView", [])
         total = data.get("recordSetTotal", 0)
@@ -347,7 +470,7 @@ def fetch_products_for_category(
             break
 
         page += 1
-        time.sleep(REQUEST_DELAY)  # Polite delay between pages
+        _polite_pause()  # Randomised delay between pages to avoid bot fingerprinting
 
     # Permanent truncation observability: if the category yielded fewer
     # products than the API's own total, say so loudly in the nightly
@@ -358,7 +481,7 @@ def fetch_products_for_category(
             category_title, len(all_products), total,
         )
 
-    return all_products
+    return all_products, False  # blocked=False — category completed normally
 
 
 def fetch_all_products(client: httpx.Client, categories: list[dict[str, str]]) -> list[dict[str, Any]]:
@@ -368,23 +491,46 @@ def fetch_all_products(client: httpx.Client, categories: list[dict[str, str]]) -
     both "Tablets - iPad" and "Apple Products").  We track seen partNumbers
     and skip duplicates to avoid inflating the dataset.
 
+    Implements a circuit breaker: if LISTING_BLOCK_CIRCUIT consecutive
+    categories end in a persistent Akamai block, the listing loop aborts
+    early.  A mass block should fail the night quickly via the downstream
+    row-count validation floor, not burn hours in cooldowns.
+
     Returns a list of (product_dict, category_title) tuples.
     """
     seen_part_numbers: set[str] = set()
     all_products: list[tuple[dict[str, Any], str]] = []
     empty_categories: list[str] = []
+    consecutive_blocks = 0  # consecutive categories ending in persistent block
 
     for i, cat in enumerate(categories, 1):
         log.info("Category %d/%d: %s (id=%s)", i, len(categories), cat["title"], cat["id"])
 
         try:
-            products = fetch_products_for_category(client, cat["id"], cat["title"])
+            products, blocked = fetch_products_for_category(client, cat["id"], cat["title"])
         except httpx.HTTPStatusError as e:
             log.warning("  Skipping [%s]: HTTP %s", cat["title"], e.response.status_code)
             continue
 
+        # Track consecutive persistent blocks for the circuit breaker.
+        # A category that completes without a persistent block resets the
+        # counter; a blocked category increments it.
+        if blocked:
+            listing_block_stats["categories_skipped"] += 1
+            consecutive_blocks += 1
+        else:
+            consecutive_blocks = 0
+
         if not products:
             empty_categories.append(cat["title"])
+            # Check circuit breaker even if the category returned no products
+            if consecutive_blocks >= LISTING_BLOCK_CIRCUIT:
+                log.error(
+                    "Circuit breaker tripped: %d consecutive categories blocked by Akamai — "
+                    "aborting listing phase with %d products collected so far.",
+                    consecutive_blocks, len(all_products),
+                )
+                break
             continue
 
         # De-duplicate: skip products we've already seen from another category
@@ -399,12 +545,33 @@ def fetch_all_products(client: httpx.Client, categories: list[dict[str, str]]) -
         if new_count < len(products):
             log.info("    → %d new, %d duplicates skipped", new_count, len(products) - new_count)
 
-        time.sleep(REQUEST_DELAY)  # Polite delay between categories
+        # Circuit breaker: if too many consecutive categories are blocked,
+        # stop the listing loop to avoid burning hours in cooldowns.
+        if consecutive_blocks >= LISTING_BLOCK_CIRCUIT:
+            log.error(
+                "Circuit breaker tripped: %d consecutive categories blocked by Akamai — "
+                "aborting listing phase with %d products collected so far.",
+                consecutive_blocks, len(all_products),
+            )
+            break
+
+        _polite_pause()  # Randomised delay between categories to avoid bot fingerprinting
 
     if empty_categories:
         log.info("Categories with zero products (%d): %s", len(empty_categories), ", ".join(empty_categories[:20]))
         if len(empty_categories) > 20:
             log.info("  … and %d more", len(empty_categories) - 20)
+
+    # Observability: always log block stats so nightly logs show the
+    # listing phase's Akamai interaction even when all counters are zero.
+    log.info(
+        "Kotsovolos listing block stats: blocks_detected=%d, retries_recovered=%d, "
+        "categories_skipped=%d, listing_requests_total=%d",
+        listing_block_stats["blocks_detected"],
+        listing_block_stats["retries_recovered"],
+        listing_block_stats["categories_skipped"],
+        listing_block_stats["listing_requests_total"],
+    )
 
     return all_products
 
