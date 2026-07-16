@@ -670,6 +670,18 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
     #
     # Runs AFTER offer links have been repointed (2c) and BEFORE the
     # transaction is committed/rolled-back, so everything is atomic.
+    #
+    # IMPORTANT — "demote, not abort": an id that Phase 1 labeled
+    # "absorbed" can still be referenced by store_products after 2c.
+    # This happens legitimately when the cluster pipeline splits a
+    # product's offers into different clusters: one cluster merge-absorbs
+    # the product_id while another cluster independently attaches (or
+    # key-lookups) to that same product_id, so 2c re-links some offers
+    # right back onto it.  In that case "absorbed" is a stale label —
+    # the product still owns offers and must survive.  Deleting it would
+    # orphan those store_products rows.  Such ids are therefore KEPT
+    # ALIVE and excluded from the entire merge aftermath below (no
+    # subscription repoint, no redirect, no deletion).
     # -------------------------------------------------------------------
     merge_decisions = [d for d in decisions if d["resolution"] == "merged"]
 
@@ -703,7 +715,77 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
     redirect_rows_written = 0
     compressed_chain_rows = 0
     deleted_absorbed_products = 0
+    # Count of "absorbed" product ids that turned out to still be
+    # referenced by store_products and were therefore kept alive
+    # (demoted out of the merge aftermath).  Initialized to 0 so it is
+    # printed on every run, including runs with no merges.
+    merge_kept_alive_products = 0
+    kept_alive_pids: set[int] = set()
 
+    if all_absorbed_ids:
+        # -- KEEP-ALIVE DETECTION (runs before steps (a), (b), (c)) --
+        # Fetch every store_products row that still references an
+        # "absorbed" id after the 2c link updates.  Any id that comes
+        # back is a split-cluster reattachment (see block comment above):
+        # it still owns offers, so it must be excluded from the merge
+        # aftermath entirely.
+        cur.execute(
+            """
+            SELECT product_id, store, store_product_id
+            FROM store_products
+            WHERE product_id = ANY(%s)
+            """,
+            (all_absorbed_ids,),
+        )
+        dangling_rows = cur.fetchall()
+        kept_alive_pids = {row[0] for row in dangling_rows}
+
+        if kept_alive_pids:
+            merge_kept_alive_products = len(kept_alive_pids)
+
+            # Loudly report exactly which offers still point at each
+            # kept-alive id, so the run log explains why these ids were
+            # not deleted.
+            print()
+            print("  " + "!" * 76)
+            print("  WARNING: store_products rows still reference "
+                  "'absorbed' product ids after 2c.")
+            print("  These product ids will be KEPT ALIVE and excluded "
+                  "from the merge aftermath")
+            print("  (no subscription repoint, no redirect, no deletion):")
+            for pid, store, store_product_id in dangling_rows:
+                print(f"    product_id={pid}  store={store}  "
+                      f"store_product_id={store_product_id}")
+            print("  " + "!" * 76)
+            print()
+
+            # Filter kept-alive ids out BEFORE steps (a) and (b), not
+            # just before the delete in (c):
+            #   (a) repointing their subscriptions would strip
+            #       subscribers off a product that continues to exist;
+            #   (b) writing a merged_products redirect would send the
+            #       frontend away from a live product that still has
+            #       offers.
+            # Both would be corruptions in their own right even if the
+            # delete in (c) were skipped.
+            all_absorbed_ids = [
+                pid for pid in all_absorbed_ids if pid not in kept_alive_pids
+            ]
+            filtered_survivor_absorbed: list[tuple[int, list[int]]] = []
+            for survivor, absorbed_list in survivor_absorbed:
+                remaining = [
+                    a for a in absorbed_list if a not in kept_alive_pids
+                ]
+                # Drop merge entries whose absorbed list became empty —
+                # there is nothing left to repoint/redirect/delete for
+                # that survivor.
+                if remaining:
+                    filtered_survivor_absorbed.append((survivor, remaining))
+            survivor_absorbed = filtered_survivor_absorbed
+
+    # Steps (a)-(c) operate only on the filtered ids.  If every
+    # "absorbed" id was kept alive, the list is now empty and the whole
+    # aftermath is skipped.
     if all_absorbed_ids:
         # -- Step (a): REPOINT SUBSCRIPTIONS --
         # For each absorbed id, move its price_subscriptions to the survivor,
@@ -783,22 +865,13 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
                 compressed_chain_rows += cur.rowcount
 
         # -- Step (c): DELETE ABSORBED PRODUCTS --
-        # Safety assertion: verify no store_products rows still reference
-        # absorbed ids.  If any do, it means offers were not fully
-        # repointed in step 2c — abort the entire transaction rather than
-        # leaving orphan references.
-        cur.execute(
-            "SELECT COUNT(*) FROM store_products WHERE product_id = ANY(%s)",
-            (all_absorbed_ids,),
-        )
-        dangling_count = cur.fetchone()[0]
-        if dangling_count != 0:
-            raise RuntimeError(
-                f"ABORTING: {dangling_count} store_products row(s) still "
-                f"reference absorbed product ids {all_absorbed_ids}. "
-                f"Offers must be repointed before deleting absorbed products."
-            )
-
+        # No dangling-reference guard is needed here: the keep-alive
+        # detection at the top of 2d already queried store_products for
+        # every absorbed id and filtered out any id that was still
+        # referenced.  By construction, every id remaining in
+        # all_absorbed_ids has zero store_products references, so the
+        # DELETE below cannot orphan any offer rows.
+        #
         # Safe to delete: offers repointed (2c), subscriptions repointed
         # (a), redirects recorded (b).  The FK from merged_products.new_id
         # references products(id) — new_id always points at the survivor
@@ -844,6 +917,12 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
     print(f"  redirect_rows_written:    {redirect_rows_written}")
     print(f"  compressed_chain_rows:    {compressed_chain_rows}")
     print(f"  deleted_absorbed_products:{deleted_absorbed_products}")
+    # Products labeled "absorbed" by Phase 1 that were kept alive because
+    # store_products still referenced them after 2c (split-cluster
+    # reattachment) — see the keep-alive detection in section 2d.
+    print(f"  merge_kept_alive_products:{merge_kept_alive_products}")
+    if kept_alive_pids:
+        print(f"    kept_alive_pids: {sorted(kept_alive_pids)}")
 
     _header("Review flags")
     print(f"\n  needs_review total:   {needs_review_total}")
