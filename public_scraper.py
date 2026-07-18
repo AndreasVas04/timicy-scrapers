@@ -137,19 +137,32 @@ DEFAULT_HEADERS = {
 }
 
 # Lowercased Greek availability texts that count as in stock, i.e. the
-# product can be ordered at the shown price right now.  Compared after
+# product can be ordered at the shown price right now. Compared after
 # .strip().lower() against sku.availability.
 #
-# "προσωρινά εξαντλημένο" (temporarily out of stock) is intentionally
-# excluded, and any unknown or missing text maps to unavailable by
-# design — a fail-safe so that new wordings never silently mark
-# products as in stock.  The per-run availability text distribution
-# logged in the final summary surfaces such new values.
+# Per the cross-store availability doctrine, "available" means the
+# customer can obtain the product now: immediate stock, by-order,
+# pre-order, and last-pieces states all qualify. Pre-order variants
+# ("αναμένεται σύντομα", "προπαραγγελία", "διαθέσιμο για προπαραγγελία")
+# and the last-pieces state ("τελευταία τεμάχια!") are included for
+# this reason.
+#
+# The "sold out" family is intentionally excluded and maps to
+# unavailable: "προσωρινά εξαντλημένο" (temporarily out of stock),
+# "μόλις εξαντλήθηκε!", "εξαντλήθηκε", and "ουπς, μόλις εξαντλήθηκε!".
+# Any unknown or missing text also maps to unavailable by design, a
+# fail-safe so that new wordings never silently mark products as in
+# stock. The per-run availability text distribution logged in the final
+# summary surfaces such new values.
 IN_STOCK_TEXTS = {
-    "άμεσα διαθέσιμο",            # immediately available
-    "διαθέσιμο",                  # available
-    "κατόπιν παραγγελίας",        # by order
-    "διαθέσιμο με παραγγελία",    # available with order
+    "άμεσα διαθέσιμο",             # immediately available
+    "διαθέσιμο",                   # available
+    "κατόπιν παραγγελίας",         # by order
+    "διαθέσιμο με παραγγελία",     # available with order
+    "αναμένεται σύντομα",          # arriving soon (pre-order / restock)
+    "προπαραγγελία",               # pre-order
+    "διαθέσιμο για προπαραγγελία", # available for pre-order
+    "τελευταία τεμάχια!",          # last pieces in stock
 }
 
 # Per-run distribution of the verbatim availability text seen in API
