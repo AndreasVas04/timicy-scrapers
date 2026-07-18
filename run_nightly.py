@@ -52,7 +52,7 @@ from dotenv import load_dotenv
 
 STORE_REGISTRY: list[tuple[str, str, int]] = [
     ("istorm",      "istorm_scraper.py",      2048),
-    ("kotsovolos",  "kotsovolos_scraper.py",   8907),
+    ("kotsovolos",  "kotsovolos_scraper.py",  12100),
     ("stephanis",   "stephanis_scraper.py",    26266),
     ("electroline", "electroline_scraper.py",  9354),
     ("public",      "public_scraper.py",       11792),
