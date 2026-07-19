@@ -13,10 +13,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +35,10 @@ BASE_URL = "https://istorm.com.cy"
 PRODUCTS_ENDPOINT = f"{BASE_URL}/products.json"
 PAGE_LIMIT = 250          # Shopify max items per page
 REQUEST_DELAY = 1.0       # Seconds between paginated requests (polite crawling)
-MAX_RETRIES = 3           # Retry attempts on 429 / 5xx responses
+MAX_RETRIES = 6           # Retry attempts on 429 / 5xx before giving up
+BASE_BACKOFF = 2.0        # Base seconds for exponential back-off (2, 4, 8, …)
+MAX_BACKOFF = 60.0        # Hard cap on any single back-off wait (safety ceiling)
+BACKOFF_JITTER = 1.0      # Max extra random seconds added to each back-off wait
 
 # Matches Apple-style part numbers like "MH344TY/A" or "MQDT3ZM/A".
 # Captures the region-independent root (e.g. "MH344") before the
@@ -99,27 +104,110 @@ def extract_mpn_root(mpn: str | None) -> str | None:
 
 # ── Fetcher ─────────────────────────────────────────────────────
 
-def _request_with_retry(client: httpx.Client, url: str, params: dict[str, Any]) -> httpx.Response:
-    """Perform a GET request with exponential back-off on transient errors.
+def _parse_retry_after(value: str | None) -> float | None:
+    """Interpret a Retry-After header and return the wait in seconds.
 
-    Retries up to MAX_RETRIES times on HTTP 429 (rate-limited) or any
-    5xx (server error).  Any other non-200 status raises immediately.
+    RFC 9110 allows two forms, and Shopify may send either:
+      * delta-seconds — a plain integer, e.g. "5"
+      * HTTP-date     — an absolute timestamp, e.g. "Wed, 21 Oct 2026 07:28:00 GMT"
+
+    For the HTTP-date form the remaining wait is the difference between
+    that timestamp and now, computed in UTC so a machine running in a
+    non-UTC local zone does not skew the result.
+
+    Returns None when the header is absent, malformed, or resolves to a
+    time already in the past.  The caller then falls back to its own
+    exponential back-off, so a bad header can never stall the scrape.
+    """
+    if not value:
+        return None
+
+    # Form 1: delta-seconds.  Cheapest to check, and the common case.
+    try:
+        seconds = float(value.strip())
+    except ValueError:
+        pass
+    else:
+        # Negative or zero means "retry immediately"; treat as no hint.
+        return seconds if seconds > 0 else None
+
+    # Form 2: HTTP-date.  parsedate_to_datetime raises on malformed input
+    # and may return a naive datetime if the string carries no zone, in
+    # which case RFC 9110 says to read it as UTC.
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+
+    delta = (when - datetime.now(timezone.utc)).total_seconds()
+    return delta if delta > 0 else None
+
+
+def _request_with_retry(client: httpx.Client, url: str, params: dict[str, Any]) -> httpx.Response:
+    """Perform a GET request, retrying rate-limits and server errors.
+
+    Retryable conditions:
+      * HTTP 429 — rate-limited by the origin or its CDN
+      * HTTP 5xx — server-side error, usually transient
+
+    Any other non-200 status (a 4xx that is not 429) is a genuine client
+    error that retrying cannot fix, so it raises immediately.  Transport
+    errors (timeouts, connection resets) are deliberately NOT caught here
+    and propagate to the caller — the observed failure mode is 429, and
+    widening the retry net is out of scope for this pass.
+
+    Wait time per attempt is the larger of the server's Retry-After hint
+    and our own exponential back-off (BASE_BACKOFF * 2**attempt), then
+    clamped to MAX_BACKOFF and given up to BACKOFF_JITTER extra random
+    seconds.  Honouring Retry-After keeps us inside the limit the server
+    actually asked for; the exponential floor covers servers that send no
+    hint; the cap bounds the worst case so a single page cannot hang the
+    run for minutes; and the jitter de-synchronises retries so repeated
+    attempts do not land in lockstep with other traffic.
     """
     for attempt in range(MAX_RETRIES):
         resp = client.get(url, params=params)
+
         if resp.status_code == 200:
             return resp
-        # Retry on rate-limiting (429) or server errors (5xx)
-        if resp.status_code in (429,) or resp.status_code >= 500:
-            wait = 2 ** attempt  # Exponential back-off: 1s, 2s, 4s
-            log.warning("HTTP %s on attempt %d, retrying in %ds…", resp.status_code, attempt + 1, wait)
-            time.sleep(wait)
-            continue
-        # Non-retryable client errors (4xx except 429) — fail fast
-        resp.raise_for_status()
-    # All retries exhausted — raise the last error
+
+        if resp.status_code == 429 or resp.status_code >= 500:
+            # Retryable HTTP status.  A 429 normally carries Retry-After;
+            # 5xx sometimes does.
+            retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+            log.warning(
+                "HTTP %s on attempt %d/%d (Retry-After: %s)",
+                resp.status_code, attempt + 1, MAX_RETRIES,
+                resp.headers.get("Retry-After", "none"),
+            )
+        else:
+            # Non-retryable client error (4xx other than 429) — fail fast
+            # rather than burning attempts on a request that cannot succeed.
+            resp.raise_for_status()
+
+        # Exponential back-off floor: 2s, 4s, 8s, 16s, 32s, 60s (capped).
+        backoff = BASE_BACKOFF * (2 ** attempt)
+        # Respect the server's hint when it asks for longer than our floor.
+        if retry_after is not None:
+            backoff = max(backoff, retry_after)
+        # Clamp before jitter so the ceiling is never exceeded by much.
+        backoff = min(backoff, MAX_BACKOFF)
+        wait = backoff + random.uniform(0.0, BACKOFF_JITTER)
+
+        # Do not sleep after the final attempt — nothing follows it.
+        if attempt == MAX_RETRIES - 1:
+            break
+
+        log.warning("Retrying in %.1fs (attempt %d/%d)…", wait, attempt + 1, MAX_RETRIES)
+        time.sleep(wait)
+
+    # All retries exhausted — re-raise the final retryable HTTP status.
     resp.raise_for_status()
-    return resp  # unreachable but keeps type checker happy
+    return resp  # unreachable for non-200, but keeps the type checker happy
 
 
 def fetch_all_products() -> list[dict[str, Any]]:
