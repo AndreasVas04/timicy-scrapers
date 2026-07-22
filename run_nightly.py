@@ -59,14 +59,24 @@ STORE_REGISTRY: list[tuple[str, str, int]] = [
     ("bionic",      "bionic_scraper.py",       5180),
 ]
 
-# Per-stage subprocess timeouts (seconds).  Normal runtimes are ~19s each,
-# so 1800s is ~90× headroom.  The purpose is to convert an infinite hang
-# (e.g. a stalled DB connection) into a fast, clearly-labeled stage failure
-# instead of waiting for the CI job-level timeout hours later.
+# Per-stage subprocess timeouts (seconds).
 #
-# Scrapers intentionally have NO per-process timeout — their runtime varies
-# legitimately (longest store ~1h40m) and the CI job timeout remains their
-# backstop.
+# INGEST / WRITER: normal runtimes are ~19s each, so 1800s is ~90x headroom.
+# The purpose is to convert an infinite hang (e.g. a stalled DB connection)
+# into a fast, clearly-labeled stage failure instead of waiting for the CI
+# job-level timeout hours later.
+#
+# SCRAPERS: all scrapers share one wall-clock deadline measured from launch.
+# Legitimate runtimes vary widely (slowest observed full-night scrape phase:
+# ~3h17m under heavy anti-bot throttling), so the ceiling sits well above
+# that.  Without a deadline, a single hung scraper blocks the gather point:
+# no store output is ever printed, nothing downstream runs, and the CI
+# job-level kill hours later discards the still-buffered stdout - an entire
+# night lost with zero diagnostics.  With it, a hung scraper is killed and
+# labeled, its partial log is printed (scraper output goes to a file, so it
+# survives the kill), and the remaining stores continue fail-soft.
+# Budget check: 14400 + 1800 + 1800 = 5h00m, inside the 5h30m CI job limit.
+SCRAPER_TIMEOUT_S = 14400
 INGEST_TIMEOUT_S = 1800
 WRITER_TIMEOUT_S = 1800
 
@@ -85,10 +95,18 @@ def run_scrapers(selected_stores: list[tuple[str, str, int]]) -> dict[str, int]:
     Each scraper runs as a subprocess with stdout+stderr redirected to
     logs/<store>.log (overwritten per run).  Parallel execution between
     stores is safe: each scraper is a single serial HTTP client with its
-    own polite delays built in — they do not share sessions or rate limits.
+    own polite delays built in - they do not share sessions or rate limits.
 
-    After all scrapers finish, their log files are printed sequentially
-    with clear separators so CI output is readable and never interleaved.
+    All scrapers share one wall-clock deadline (SCRAPER_TIMEOUT_S from
+    launch).  A scraper still running at the deadline is killed and its
+    nonzero exit code flows into validation, which excludes the store
+    downstream exactly like any other scraper failure.  Because scraper
+    output goes to a log file (not a pipe), everything the scraper printed
+    before the kill survives and is shown below - pinpointing the stall.
+
+    After all scrapers finish (or are killed), their log files are printed
+    sequentially with clear separators so CI output is readable and never
+    interleaved.
     """
     LOGS_DIR.mkdir(exist_ok=True)
 
@@ -105,13 +123,29 @@ def run_scrapers(selected_stores: list[tuple[str, str, int]]) -> dict[str, int]:
         )
         processes.append((store, proc, log_path, log_file))
 
-    print(f"  Launched {len(processes)} scrapers concurrently, waiting...")
+    print(f"  Launched {len(processes)} scrapers concurrently "
+          f"(shared deadline: {SCRAPER_TIMEOUT_S}s), waiting...")
 
-    # Wait for all to finish.  No timeout here — the CI job-level timeout
-    # is the backstop (typically 4-5 hours).
+    # One deadline for the whole batch: scrapers start within milliseconds
+    # of each other, so a shared deadline equals a per-scraper timeout.
+    deadline = time.monotonic() + SCRAPER_TIMEOUT_S
+
+    # Wait for each scraper up to the remaining time budget.  A scraper
+    # that outlives the deadline is killed and reaped; its nonzero exit
+    # code makes validation exclude the store, fail-soft, while the
+    # remaining stores and the rest of the pipeline continue normally.
     exit_codes: dict[str, int] = {}
+    timed_out: set[str] = set()
     for store, proc, _log_path, log_file in processes:
-        proc.wait()
+        remaining = max(0.0, deadline - time.monotonic())
+        try:
+            proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            print(f"\n[SCRAPE] TIMEOUT: {store} still running after "
+                  f"{SCRAPER_TIMEOUT_S}s - killing it.")
+            proc.kill()
+            proc.wait()  # Reap the killed child so returncode is populated.
+            timed_out.add(store)
         log_file.close()
         exit_codes[store] = proc.returncode
 
@@ -119,7 +153,11 @@ def run_scrapers(selected_stores: list[tuple[str, str, int]]) -> dict[str, int]:
     # and never interleaved between stores.
     for store, _proc, log_path, _lf in processes:
         print(f"\n{'=' * 60}")
-        print(f"  {store} (exit code: {exit_codes[store]})")
+        if store in timed_out:
+            print(f"  {store} (exit code: {exit_codes[store]}) "
+                  f"- TIMED OUT after {SCRAPER_TIMEOUT_S}s, killed; partial log follows")
+        else:
+            print(f"  {store} (exit code: {exit_codes[store]})")
         print(f"{'=' * 60}")
         if log_path.exists():
             print(log_path.read_text(encoding="utf-8", errors="replace"))
