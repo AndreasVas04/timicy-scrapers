@@ -25,6 +25,8 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, Field
 
+import proxy_pool
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -220,9 +222,24 @@ def fetch_all_products() -> list[dict[str, Any]]:
     """
     all_products: list[dict[str, Any]] = []
     page = 1
+
+    # Route Shopify requests through the shared proxy pool when configured.
+    # GitHub Actions runner IPs (shared Azure ranges) are intermittently
+    # throttled by the Shopify edge with 429s that persist even when the
+    # server's own Retry-After hint is honoured repeatedly — an IP-reputation
+    # block that waiting cannot clear.  A single pool IP is enough here: the
+    # full catalogue is ~14 requests.  An empty pool (proxy env vars not set)
+    # yields None, which httpx treats as a direct connection — the normal
+    # local-development path.  NEVER log the proxy URL — it contains
+    # credentials; log only the connection mode.
+    proxies = proxy_pool.build_proxy_urls()
+    proxy_url = proxies[0] if proxies else None
+    log.info("Shopify fetches %s.", "via proxy" if proxy_url else "direct")
+
     with httpx.Client(
         headers={"User-Agent": "timicy-scraper/1.0 (price comparison project)"},
         timeout=30.0,
+        proxy=proxy_url,
     ) as client:
         # Pagination loop: keep fetching until Shopify returns an empty page
         while True:
