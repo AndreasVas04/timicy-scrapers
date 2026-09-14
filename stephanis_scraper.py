@@ -494,7 +494,16 @@ class AdaptiveFetcher:
                     log.debug("HTTP %s for %s — skipping", resp.status_code, url)
                     return (url, None)
 
-                except (httpx.TimeoutException, httpx.ConnectError, httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.CloseError) as e:
+                # Catch every transport-level failure on this hop, including
+                # httpx.ProxyError (the proxy endpoint itself answering 5xx).
+                # httpx.TransportError is the base class of the timeout,
+                # network, protocol and proxy exception families, so the six
+                # classes previously listed here are still covered.  An
+                # uncaught exception inside asyncio.gather aborts the whole
+                # run with zero rows, so this retry loop must own every
+                # transport failure mode.  After MAX_RETRIES the URL is
+                # returned as (url, None) and counted as a failure.
+                except httpx.TransportError as e:
                     wait = 2 ** attempt
                     log.warning(
                         "%s for %s (attempt %d), retrying in %ds…",
