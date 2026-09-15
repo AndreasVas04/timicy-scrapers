@@ -683,33 +683,33 @@ def _run_writer(conn, offers, all_clusters, cluster_methods, cluster_keys,
     # ALIVE and excluded from the entire merge aftermath below (no
     # subscription repoint, no redirect, no deletion).
     # -------------------------------------------------------------------
-    merge_decisions = [d for d in decisions if d["resolution"] == "merged"]
+    # Build the survivor -> absorbed-ids map directly from merge_details.
+    # Phase 1 appends one merge_details entry for EVERY merge event, before
+    # the collision-merge step (Phase 1b) runs.  Phase 1b can fold a
+    # "merged" decision into a "collision_merged" decision when several
+    # clusters resolve to the same survivor.  Deriving this map from the
+    # decisions list filtered on resolution == "merged" silently dropped
+    # exactly those folded merges, so their absorbed product ids received
+    # no subscription repoint, no redirect and no delete, and were left
+    # behind as products rows with zero offers.  merge_details is the
+    # complete record of merges, so it is the source of truth here.  The
+    # keep-alive detection below still protects any absorbed id that
+    # store_products continues to reference after the 2c link updates.
+    survivor_to_absorbed: dict[int, list[int]] = defaultdict(list)
+    for md in merge_details:
+        survivor_to_absorbed[md["survivor"]].extend(md["absorbed"])
 
     # Collect ALL absorbed product ids across all merge events for batched
     # operations — avoids one-statement-per-id round-trips.
     all_absorbed_ids: list[int] = []
-    # Map survivor -> list of absorbed ids (for per-merge operations).
+    # Map survivor -> sorted, de-duplicated list of absorbed ids, used by
+    # the per-merge operations in steps (a) and (b).  Sorted so the order
+    # of SQL statements is deterministic from run to run.
     survivor_absorbed: list[tuple[int, list[int]]] = []
-    for d in merge_decisions:
-        survivor = d["resolved_pid"]
-        absorbed = d["rep"]["review_reason"]
-        # Extract absorbed ids from the merge_details list (already computed
-        # in Phase 1).
-        absorbed_ids = [
-            md["absorbed"]
-            for md in merge_details
-            if md["survivor"] == survivor
-        ]
-        # Flatten: merge_details stores absorbed as a list of ints.
-        flat_absorbed = []
-        for a in absorbed_ids:
-            if isinstance(a, list):
-                flat_absorbed.extend(a)
-            else:
-                flat_absorbed.append(a)
-        if flat_absorbed:
-            survivor_absorbed.append((survivor, flat_absorbed))
-            all_absorbed_ids.extend(flat_absorbed)
+    for survivor in sorted(survivor_to_absorbed):
+        absorbed_list = sorted(set(survivor_to_absorbed[survivor]))
+        survivor_absorbed.append((survivor, absorbed_list))
+        all_absorbed_ids.extend(absorbed_list)
 
     repointed_subscriptions = 0
     redirect_rows_written = 0
