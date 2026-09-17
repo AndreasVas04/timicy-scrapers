@@ -51,7 +51,7 @@ from dotenv import load_dotenv
 # mass-mark offers as unavailable downstream.
 
 STORE_REGISTRY: list[tuple[str, str, int]] = [
-    ("istorm",      "istorm_scraper.py",      2048),
+    ("istorm",      "istorm_scraper.py",      3600),
     ("kotsovolos",  "kotsovolos_scraper.py",  12100),
     ("stephanis",   "stephanis_scraper.py",    26266),
     ("electroline", "electroline_scraper.py",  9354),
