@@ -206,11 +206,32 @@ def _request_with_retry(
 ) -> httpx.Response:
     """Perform a GET request with exponential back-off on transient errors.
 
-    Retries up to MAX_RETRIES times on HTTP 429 (rate-limited) or any
-    5xx (server error).  Any other non-200 status raises immediately.
+    Retries up to MAX_RETRIES times on HTTP 429 (rate-limited), any 5xx
+    (server error), or a transport-level failure (read timeout, connect
+    error, proxy error). Any other non-200 status raises immediately.
     """
+    resp: httpx.Response | None = None
+    last_exc: httpx.TransportError | None = None
     for attempt in range(MAX_RETRIES):
-        resp = client.get(url, params=params)
+        resp = None
+        try:
+            resp = client.get(url, params=params)
+        except httpx.TransportError as e:
+            # httpx.TransportError is the base class of ReadTimeout,
+            # ConnectTimeout, ConnectError, ProxyError and
+            # RemoteProtocolError. Before this handler existed a single
+            # read timeout on one listing page escaped the loop and aborted
+            # the whole scrape, losing every category (run of 16 September:
+            # category 271 of 431, zero rows written). Treat it like a 5xx:
+            # back off and request the same page again.
+            last_exc = e
+            wait = 2 ** attempt
+            log.warning(
+                "%s for %s (attempt %d/%d), retrying in %ds…",
+                type(e).__name__, url, attempt + 1, MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
+            continue
         if resp.status_code == 200:
             return resp
         # Retry on rate-limiting (429) or server errors (5xx)
@@ -225,6 +246,9 @@ def _request_with_retry(
         # Non-retryable client errors (4xx except 429) — fail fast
         resp.raise_for_status()
     # All retries exhausted — raise the last error
+    if resp is None:
+        assert last_exc is not None
+        raise last_exc
     resp.raise_for_status()
     return resp  # unreachable but keeps type checker happy
 
