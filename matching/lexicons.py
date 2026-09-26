@@ -402,6 +402,13 @@ COLOR_WORDS: set[str] = {
     # Samsung marketing prefix — appears as "Awesome Black/White/Lime/etc."
     # Safe to strip standalone in this catalog.
     "awesome",
+
+    # Greek plural, feminine and colloquial colour forms seen in Public and
+    # Electroline titles (accent-stripped lowercase, as matched at runtime)
+    "μαυρα", "μαυρη", "λευκα", "λευκη", "ασπρο", "ασπρα", "ασπρη",
+    "κοκκινα", "κοκκινη", "πρασινη", "γκριζο", "γκριζα", "γριζο",
+    "μολυβι", "ανθρακι", "κρεμ", "γραφιτης", "βιολετι", "πολυχρωμο",
+    "μπορντο", "χρυσαφι",
 }
 
 

@@ -441,8 +441,9 @@ def extract_model_codes(text: str) -> list[str]:
 
     Processing:
       1. Lowercase and strip accents.
-      2. Join alphanumeric segments separated by a single hyphen or slash
-         into one token (so "np-by1" becomes "npby1").
+      2. Join alphanumeric segments separated by a single hyphen, slash or
+         dot into one token (so "np-by1" becomes "npby1" and "bco411.b"
+         becomes "bco411b").
       3. Split on whitespace.
       4. A token qualifies if ALL of the following hold:
          - alphanumeric-only (after the join step),
@@ -465,9 +466,16 @@ def extract_model_codes(text: str) -> list[str]:
     # Lowercase and strip accents to normalize the input.
     t = strip_accents(text.lower())
 
-    # Join alphanumeric segments separated by a single hyphen or slash.
+    # Join alphanumeric segments separated by a single hyphen, slash or dot.
     # "np-by1" -> "npby1", "abc/def" -> "abcdef", but "a--b" stays as-is.
-    t = re.sub(r"([a-z0-9])[-/]([a-z0-9])", r"\1\2", t)
+    # The dot is joined so that dotted manufacturer codes such as "bco411.b",
+    # "ecam310.60.b" and "wh1000xm5b.ce7" become "bco411b", "ecam31060b" and
+    # "wh1000xm5bce7"; previously the dot made them fail the alphanumeric
+    # check below, so they never took part in matching.
+    # Side effect: decimal quantities such as "6.7in" or "2.4ghz" also
+    # collapse ("67in", "24ghz"), but they are still rejected by the
+    # unit-suffix check below, so they cannot become model codes.
+    t = re.sub(r"([a-z0-9])[-/.]([a-z0-9])", r"\1\2", t)
 
     tokens = t.split()
     seen: set[str] = set()
