@@ -21,6 +21,7 @@ import io
 import json
 import os
 import sys
+from collections import Counter
 from pathlib import Path
 
 import psycopg
@@ -155,6 +156,48 @@ def build_copy_buffer(rows: list[dict]) -> io.StringIO:
     return buf
 
 
+def _print_unmapped_categories(store: str, counts: Counter[tuple[str, str]]) -> None:
+    """
+    Print the "UNMAPPED CATEGORIES" report for one store.
+
+    `counts` maps (store, raw_product_type) -> number of rows that were
+    skipped because that raw product type has no entry in category_map.
+    Only the entries that belong to `store` are printed, in alphabetical
+    order of product type (plain string sort, so uppercase sorts before
+    lowercase), each followed by its row count:
+
+      UNMAPPED CATEGORIES for bionic:
+        - 3D Printers (1)
+        - Coffee Machines (3)
+
+    If the store has no unmapped types, nothing is printed (not even the
+    header). This is logging only: it just prints, with no database access
+    and no changes to `counts`, so it can be called and tested without a
+    connection.
+
+    The counts exist so that nobody adds a category mapping without knowing
+    how many rows it would bring in — check them before editing
+    category_mapping.csv. They are an estimate, not the SQL skip count: the
+    caller builds them in Python from the category_mapping.csv lookup, with
+    the product type stripped of surrounding whitespace and empty types left
+    out, whereas the SQL step joins the category_map table on the raw value.
+    So the sum of these counts can differ from the "skipped (no category)"
+    figure on the per-store summary line.
+    """
+    # Keep only this store's product types. Every entry compared below has
+    # the same store, so sorting the bare type names is the same as sorting
+    # (store, type) tuples.
+    store_types = sorted(pt for (s, pt) in counts if s == store)
+    if not store_types:
+        return
+
+    # Header line: two leading spaces, matching the per-store summary line.
+    print(f"  UNMAPPED CATEGORIES for {store}:")
+    # One line per unmapped type: four leading spaces, then "- <type> (<rows>)".
+    for pt in store_types:
+        print(f"    - {pt} ({counts[(store, pt)]})")
+
+
 def ingest_store(conn, store: str, category_map: dict[tuple[str, str], str],
                  mark_disappeared: bool = False):
     """
@@ -193,12 +236,21 @@ def ingest_store(conn, store: str, category_map: dict[tuple[str, str], str],
         print(f"  {store}: collapsed {total - len(rows)} duplicate store_product_id rows -> {len(rows)} unique")
         total = len(rows)
 
-    # Collect unmapped (store, product_type) pairs for the summary
-    unmapped_pairs: set[tuple[str, str]] = set()
+    # Count, per (store, product_type) pair, how many rows are skipped because
+    # that product type has no entry in category_map. This feeds the UNMAPPED
+    # CATEGORIES report printed after the per-store summary; it is used for
+    # logging only and does not influence which rows are skipped, inserted or
+    # updated (the SQL below decides that). The count is one per row of the
+    # deduplicated `rows` list, so a type shared by many products shows
+    # roughly how many rows a new mapping would bring in. Rows with an empty
+    # product_type are not counted: there is no type name to report for them.
+    # See _print_unmapped_categories for why these counts can differ from the
+    # SQL step's "skipped (no category)" figure.
+    unmapped_counts: Counter[tuple[str, str]] = Counter()
     for row in rows:
         raw_pt = (row.get("product_type") or "").strip()
         if raw_pt and (store, raw_pt) not in category_map:
-            unmapped_pairs.add((store, raw_pt))
+            unmapped_counts[(store, raw_pt)] += 1
 
     try:
         with conn.transaction():
@@ -428,11 +480,9 @@ def ingest_store(conn, store: str, category_map: dict[tuple[str, str], str],
               f"{price_history_written} price_history rows, "
               f"{disappeared_count} marked disappeared")
 
-        # Report unmapped categories
-        if unmapped_pairs:
-            print(f"  UNMAPPED CATEGORIES for {store}:")
-            for s, pt in sorted(unmapped_pairs):
-                print(f"    - {pt}")
+        # Report unmapped categories, each with the number of rows it skipped
+        # (prints nothing when this store has no unmapped types)
+        _print_unmapped_categories(store, unmapped_counts)
 
     except Exception as e:
         # Transaction is automatically rolled back by the context manager
