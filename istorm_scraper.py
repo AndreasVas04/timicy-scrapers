@@ -150,17 +150,23 @@ def _parse_retry_after(value: str | None) -> float | None:
 
 
 def _request_with_retry(client: httpx.Client, url: str, params: dict[str, Any]) -> httpx.Response:
-    """Perform a GET request, retrying rate-limits and server errors.
+    """Perform a GET request, retrying rate-limits, server and transport errors.
 
     Retryable conditions:
       * HTTP 429 — rate-limited by the origin or its CDN
       * HTTP 5xx — server-side error, usually transient
+      * httpx.TransportError — the request produced no response at all:
+        read/connect timeout, dropped connection, or a proxy failure
+        (httpx.ProxyError is a subclass).  One such error through the
+        proxy used to escape this function and abort the whole scrape
+        with zero rows, so it now backs off and retries like a 5xx.
 
     Any other non-200 status (a 4xx that is not 429) is a genuine client
-    error that retrying cannot fix, so it raises immediately.  Transport
-    errors (timeouts, connection resets) are deliberately NOT caught here
-    and propagate to the caller — the observed failure mode is 429, and
-    widening the retry net is out of scope for this pass.
+    error that retrying cannot fix, so it raises immediately.  If every
+    attempt fails, the final outcome is raised: the last transport
+    exception when the final attempt got no response, otherwise
+    HTTPStatusError for the final 429/5xx.  A real outage therefore still
+    fails loudly.
 
     Wait time per attempt is the larger of the server's Retry-After hint
     and our own exponential back-off (BASE_BACKOFF * 2**attempt), then
@@ -169,10 +175,45 @@ def _request_with_retry(client: httpx.Client, url: str, params: dict[str, Any]) 
     actually asked for; the exponential floor covers servers that send no
     hint; the cap bounds the worst case so a single page cannot hang the
     run for minutes; and the jitter de-synchronises retries so repeated
-    attempts do not land in lockstep with other traffic.
+    attempts do not land in lockstep with other traffic.  Transport errors
+    carry no Retry-After, so they use the exponential back-off alone.
     """
+    # Outcome of the most recent attempt: a response, or (when resp is None)
+    # the transport exception that prevented one.  Read after the loop to
+    # decide what to raise once attempts are exhausted.
+    resp: httpx.Response | None = None
+    last_exc: httpx.TransportError | None = None
     for attempt in range(MAX_RETRIES):
-        resp = client.get(url, params=params)
+        # Reset per attempt so a stale response from an earlier attempt is
+        # never mistaken for the outcome of this one.
+        resp = None
+        try:
+            resp = client.get(url, params=params)
+        except httpx.TransportError as e:
+            # No response was received (timeout, reset, proxy failure).
+            # Remember the error so it can be re-raised if this turns out
+            # to be the final attempt.
+            last_exc = e
+
+            # Same back-off as a 5xx without Retry-After: exponential floor,
+            # clamped to MAX_BACKOFF, plus random jitter.
+            backoff = min(BASE_BACKOFF * (2 ** attempt), MAX_BACKOFF)
+            wait = backoff + random.uniform(0.0, BACKOFF_JITTER)
+
+            # Final attempt: stop without sleeping; the error is raised below.
+            if attempt == MAX_RETRIES - 1:
+                log.warning(
+                    "%s for %s (attempt %d/%d), giving up.",
+                    type(e).__name__, url, attempt + 1, MAX_RETRIES,
+                )
+                break
+
+            log.warning(
+                "%s for %s (attempt %d/%d), retrying in %.1fs…",
+                type(e).__name__, url, attempt + 1, MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
+            continue
 
         if resp.status_code == 200:
             return resp
@@ -207,7 +248,11 @@ def _request_with_retry(client: httpx.Client, url: str, params: dict[str, Any]) 
         log.warning("Retrying in %.1fs (attempt %d/%d)…", wait, attempt + 1, MAX_RETRIES)
         time.sleep(wait)
 
-    # All retries exhausted — re-raise the final retryable HTTP status.
+    # All retries exhausted.  If the final attempt produced no response,
+    # re-raise its transport error; otherwise raise the final HTTP status.
+    if resp is None:
+        assert last_exc is not None
+        raise last_exc
     resp.raise_for_status()
     return resp  # unreachable for non-200, but keeps the type checker happy
 
