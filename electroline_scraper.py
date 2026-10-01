@@ -182,6 +182,43 @@ def extract_mpn_root(mpn: str | None) -> str | None:
 
 # ── Sitemap parsing ───────────────────────────────────────────────────────
 
+# Sitemap download retry settings: 3 attempts, waiting 2s then 4s between them.
+SITEMAP_MAX_ATTEMPTS = 3
+
+
+def _get_with_retry(client: httpx.Client, url: str) -> httpx.Response:
+    """GET a URL, retrying temporary failures, and return the good response.
+
+    The sitemap is the first step of the scraper, so one 403, 429 or 5xx
+    answer (or a network error) used to crash the whole run with 0 rows.
+    Those cases are retried up to SITEMAP_MAX_ATTEMPTS times, waiting
+    2**attempt seconds between tries (no wait after the last try). Other
+    4xx answers fail at once. If every try fails, the last error is raised
+    exactly as before, so the store is still excluded safely.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(SITEMAP_MAX_ATTEMPTS):
+        try:
+            resp = client.get(url)
+            if resp.status_code not in (403, 429) and resp.status_code < 500:
+                resp.raise_for_status()  # other 4xx: fail at once
+                return resp
+            last_exc = httpx.HTTPStatusError(
+                f"HTTP {resp.status_code}", request=resp.request, response=resp
+            )
+            reason = f"HTTP {resp.status_code}"
+        except httpx.TransportError as e:
+            last_exc = e
+            reason = type(e).__name__
+        if attempt + 1 < SITEMAP_MAX_ATTEMPTS:
+            wait = 2 ** (attempt + 1)
+            log.warning("%s for %s (attempt %d/%d), retrying in %ds…",
+                        reason, url, attempt + 1, SITEMAP_MAX_ATTEMPTS, wait)
+            time.sleep(wait)
+    assert last_exc is not None
+    raise last_exc
+
+
 def fetch_product_urls() -> list[str]:
     """Fetch the sitemap index and all product sub-sitemaps.
 
@@ -198,8 +235,7 @@ def fetch_product_urls() -> list[str]:
 
     with httpx.Client(headers=DEFAULT_HEADERS, timeout=30, follow_redirects=True) as client:
         # Step 1: fetch the sitemap index to get sub-sitemap URLs
-        resp = client.get(SITEMAP_INDEX_URL)
-        resp.raise_for_status()
+        resp = _get_with_retry(client, SITEMAP_INDEX_URL)
         root = ET.fromstring(resp.text)
         all_sitemaps = [loc.text for loc in root.findall(".//s:sitemap/s:loc", SITEMAP_NS)]
 
@@ -211,8 +247,7 @@ def fetch_product_urls() -> list[str]:
         # Step 2: fetch each product sub-sitemap and collect URLs
         product_urls: list[str] = []
         for sm_url in product_sitemaps:
-            resp = client.get(sm_url)
-            resp.raise_for_status()
+            resp = _get_with_retry(client, sm_url)
             sm_root = ET.fromstring(resp.text)
             urls = [loc.text for loc in sm_root.findall(".//s:url/s:loc", SITEMAP_NS)]
             product_urls.extend(urls)
