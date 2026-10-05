@@ -379,6 +379,52 @@ class TestNewColorWords(unittest.TestCase):
         self.assertEqual(once, twice)
 
 
+class TestGreekColorForms(unittest.TestCase):
+    """Greek plural, feminine and colloquial color forms are stripped from
+    titles, like the basic Greek colors.
+
+    The words are written here the way stores write them, with capitals and
+    accents. The title pipeline lowercases and strips accents before it
+    removes colors.
+    """
+
+    # black (plural, feminine), white (plural, feminine), white (colloquial,
+    # three forms), red (plural, feminine), green (feminine), grey (three
+    # forms), lead grey, anthracite, cream, violet, multicolor, bordeaux,
+    # golden.
+    FORMS = [
+        "Μαύρα", "Μαύρη", "Λευκά", "Λευκή", "Άσπρο", "Άσπρα", "Άσπρη",
+        "Κόκκινα", "Κόκκινη", "Πράσινη", "Γκρίζο", "Γκρίζα", "Γρίζο",
+        "Μολυβί", "Ανθρακί", "Κρεμ", "Βιολετί", "Πολύχρωμο", "Μπορντό",
+        "Χρυσαφί",
+    ]
+
+    def test_each_form_is_stripped_from_the_title(self):
+        """A title carrying one of the color forms normalizes to the same
+        text as the title without any color."""
+        brand = normalize_brand("Sony")
+        without_color = normalize_title("Sony WH-CH520 Ακουστικά", brand)
+        for form in self.FORMS:
+            result = normalize_title(f"Sony WH-CH520 Ακουστικά {form}", brand)
+            self.assertEqual(result, without_color,
+                             f"{form!r} was not stripped")
+
+    def test_greek_form_matches_english_color(self):
+        """'Μαύρα' in one store and 'Black' in another give the same
+        normalized title."""
+        brand = normalize_brand("Sony")
+        greek = normalize_title("Sony WH-CH520 Μαύρα", brand)
+        english = normalize_title("Sony WH-CH520 Black", brand)
+        self.assertEqual(greek, english)
+
+    def test_form_inside_a_longer_word_is_kept(self):
+        """Only whole words are stripped: 'κρεμ' (cream) must not eat the
+        beginning of 'κρεμαστό' (wall-hung)."""
+        brand = normalize_brand("Sony")
+        result = normalize_title("Sony Κρεμαστό Ηχείο", brand)
+        self.assertEqual(result, "κρεμαστο ηχειο")
+
+
 class TestVolumeNormalization(unittest.TestCase):
     """Volume unit normalization: comma/dot decimal + l/ml."""
 
@@ -439,6 +485,36 @@ class TestExtractModelCodes(unittest.TestCase):
         """Hyphenated model code 'NP-BY1' is joined to 'npby1'."""
         codes = extract_model_codes("Speaker NP-BY1 Portable")
         self.assertIn("npby1", codes)
+
+    def test_dot_joined(self):
+        """Dotted model code 'BCO411.B' is joined to 'bco411b', the same
+        way a hyphenated code is. Nothing else in the title is a code."""
+        codes = extract_model_codes("De'Longhi BCO411.B Combi Coffee Maker")
+        self.assertEqual(codes, ["bco411b"])
+
+    def test_dot_joined_regional_suffix(self):
+        """A regional suffix after a dot stays part of the code:
+        'MDRZX110APW.CE7' becomes 'mdrzx110apwce7'."""
+        codes = extract_model_codes("Sony MDRZX110APW.CE7 Headphones")
+        self.assertEqual(codes, ["mdrzx110apwce7"])
+
+    def test_two_dots_joined(self):
+        """Both dots of 'ECAM310.60.B' are joined: 'ecam31060b'."""
+        codes = extract_model_codes("De'Longhi ECAM310.60.B Magnifica Start")
+        self.assertEqual(codes, ["ecam31060b"])
+
+    def test_slash_joined(self):
+        """A slash is joined like a hyphen. This is how the mains marking
+        'D230/50' turns into the single token 'd23050'."""
+        codes = extract_model_codes("Oven HBA514BS3 D230/50")
+        self.assertEqual(codes, ["hba514bs3", "d23050"])
+
+    def test_decimal_quantities_with_units_still_excluded(self):
+        """Joining dots also turns '6.7in' into '67in' and '2.4ghz' into
+        '24ghz'. A number followed by a known unit is still not a model
+        code, so none of these is returned."""
+        codes = extract_model_codes("Phone 6.7in 2.4ghz 5.0ghz 20.5w 1.25l")
+        self.assertEqual(codes, [])
 
     def test_unit_tokens_excluded(self):
         """Unit/spec tokens should NOT be extracted as model codes."""
