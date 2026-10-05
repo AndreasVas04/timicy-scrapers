@@ -278,18 +278,46 @@ def fetch_all_products() -> list[dict[str, Any]]:
     # local-development path.  NEVER log the proxy URL — it contains
     # credentials; log only the connection mode.
     proxies = proxy_pool.build_proxy_urls()
-    proxy_url = proxies[0] if proxies else None
-    log.info("Shopify fetches %s.", "via proxy" if proxy_url else "direct")
+    # One entry per pool endpoint; [None] means a direct connection.  The
+    # first endpoint is used until the origin throttles it for a whole retry
+    # round, then the next endpoint takes over (see below).
+    endpoints: list[str | None] = list(proxies) if proxies else [None]
+    endpoint_idx = 0
+    log.info("Shopify fetches %s.", "via proxy" if proxies else "direct")
 
-    with httpx.Client(
-        headers={"User-Agent": "timicy-scraper/1.0 (price comparison project)"},
-        timeout=30.0,
-        proxy=proxy_url,
-    ) as client:
+    def make_client(idx: int) -> httpx.Client:
+        """Build a client bound to pool endpoint idx (never logs the URL)."""
+        return httpx.Client(
+            headers={"User-Agent": "timicy-scraper/1.0 (price comparison project)"},
+            timeout=30.0,
+            proxy=endpoints[idx],
+        )
+
+    client = make_client(endpoint_idx)
+    try:
         # Pagination loop: keep fetching until Shopify returns an empty page
         while True:
             log.info("Fetching page %d …", page)
-            resp = _request_with_retry(client, PRODUCTS_ENDPOINT, {"limit": PAGE_LIMIT, "page": page})
+            # Each endpoint gets one full retry round per page.  A 429 that
+            # survives the whole round means this endpoint's IP is throttled,
+            # so move to the next one and try the same page again.  Only
+            # when every endpoint has failed the page does the error escape.
+            for tried in range(len(endpoints)):
+                try:
+                    resp = _request_with_retry(
+                        client, PRODUCTS_ENDPOINT, {"limit": PAGE_LIMIT, "page": page}
+                    )
+                    break
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code != 429 or tried == len(endpoints) - 1:
+                        raise
+                    client.close()
+                    endpoint_idx = (endpoint_idx + 1) % len(endpoints)
+                    client = make_client(endpoint_idx)
+                    log.warning(
+                        "Page %d still 429 after a full retry round; switching to proxy endpoint %d/%d.",
+                        page, endpoint_idx + 1, len(endpoints),
+                    )
             data = resp.json()
             products = data.get("products", [])
             if not products:
@@ -300,6 +328,8 @@ def fetch_all_products() -> list[dict[str, Any]]:
             log.info("Page %d: %d products (running total: %d)", page, len(products), len(all_products))
             page += 1
             time.sleep(REQUEST_DELAY)  # Polite delay between requests
+    finally:
+        client.close()
     return all_products
 
 
