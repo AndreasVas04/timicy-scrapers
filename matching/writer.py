@@ -138,6 +138,23 @@ def _is_en(title: str) -> bool:
     return not _GREEK_RE.search(title)
 
 
+def _price_range(members: list[EnrichedOffer]):
+    """Return (min_price, max_price) shown as the product's "from" price range.
+
+    Prices that are missing or not above zero are ignored.  When at least one
+    offer is available and priced, only the available offers count, so the
+    "from" price is always a price that can be bought.  When nothing is
+    available, all priced offers count, so a product that is out of stock
+    everywhere keeps showing its last known price.
+    """
+    priced = [o for o in members if o.price is not None and o.price > 0]
+    buyable = [o.price for o in priced if o.available]
+    prices = buyable if buyable else [o.price for o in priced]
+    if not prices:
+        return None, None
+    return min(prices), max(prices)
+
+
 def _select_representative(
     cluster: list[int],
     offers: list[EnrichedOffer],
@@ -211,9 +228,7 @@ def _select_representative(
     rep_mpn = _most_common_tiebreak(mpns) if mpns else None
 
     # -- Aggregate price stats --
-    prices = [offers[i].price for i in cluster if offers[i].price is not None]
-    min_price = min(prices) if prices else None
-    max_price = max(prices) if prices else None
+    min_price, max_price = _price_range([offers[i] for i in cluster])
 
     # -- Availability flag --
     # True when at least one offer in the cluster is currently available
